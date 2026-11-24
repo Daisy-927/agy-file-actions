@@ -149,15 +149,23 @@ if (Test-Path $TargetPluginDir) {
   $item = Get-Item $TargetPluginDir -Force
   if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
     [IO.Directory]::Delete($TargetPluginDir)
-  } else {
-    Remove-Item -Path $TargetPluginDir -Recurse -Force
   }
 }
 New-Item -ItemType Directory -Force -Path $TargetPluginDir | Out-Null
 foreach ($sub in @("assets", "scripts", "sidecars", "vendor", "LICENSE", "NOTICE.md", "package.json", "plugin.json", "README.md")) {
   $src = Join-Path $RepoRoot $sub
-  if (Test-Path $src) {
-    Copy-Item -Path $src -Destination $TargetPluginDir -Recurse -Force
+  if (-not (Test-Path $src)) { continue }
+  if (Test-Path $src -PathType Container) {
+    $destSub = Join-Path $TargetPluginDir $sub
+    New-Item -ItemType Directory -Force -Path $destSub | Out-Null
+    Get-ChildItem -Path $src -Recurse -File | ForEach-Object {
+      $rel = [IO.Path]::GetRelativePath($src, $_.FullName)
+      $destFile = Join-Path $destSub $rel
+      New-Item -ItemType Directory -Force -Path (Split-Path $destFile -Parent) | Out-Null
+      Copy-Item -Path $_.FullName -Destination $destFile -Force
+    }
+  } else {
+    Copy-Item -Path $src -Destination (Join-Path $TargetPluginDir $sub) -Force
   }
 }
 Write-Output "[agy-file-actions] Installed plugin directory: $TargetPluginDir"
