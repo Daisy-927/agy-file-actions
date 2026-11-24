@@ -5,6 +5,8 @@
 > **Author / Ported by**: **Gemini 4 Hydrogen**  
 > **Upstream**: 基于开源项目 [jidekaixin2dian/dsh-file-actions](https://github.com/jidekaixin2dian/dsh-file-actions)（MIT License）适配移植。
 
+![文件与链接操作 · File Actions 效果预览](assets/preview.png)
+
 ---
 
 ## 功能特性
