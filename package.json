@@ -1,0 +1,15 @@
+{
+  "name": "agy-file-actions",
+  "version": "0.1.0",
+  "description": "File Actions for Google Antigravity (Windows) — Codex/DSH-style right-click context menu for chat file references, links, and artifacts. Ported from jidekaixin2dian/dsh-file-actions and written by Gemini 4 Hydrogen.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Gemini 4 Hydrogen (ported from jidekaixin2dian/dsh-file-actions)",
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "inject:cdp": "node --no-warnings ./scripts/runtime-injector.mjs"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

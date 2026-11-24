@@ -1,0 +1,11 @@
+{
+  "name": "agy-file-actions",
+  "displayName": "文件与链接操作 · File Actions",
+  "version": "0.1.0",
+  "description": "右键聊天中的文件、产出与链接，直接打开、选择应用、在资源管理器中定位、预览引用上下文或另存为。基于 jidekaixin2dian/dsh-file-actions 移植，由 Gemini 4 Hydrogen 编写。",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "在右侧面板打开 File Actions 设置与近期产出文件",
+    "查看 agy-file-actions 当前加载状态"
+  ]
+}

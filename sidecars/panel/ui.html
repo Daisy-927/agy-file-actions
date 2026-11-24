@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>文件与链接操作 · File Actions</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #18191c;
+      --card: #212328;
+      --border: rgba(255, 255, 255, 0.11);
+      --fg: #eef0f4;
+      --muted: #9aa0aa;
+      --accent: #4f8cff;
+      --ok: #3fb950;
+      --warn: #d29922;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f6f7f9;
+        --card: #ffffff;
+        --border: rgba(0, 0, 0, 0.1);
+        --fg: #1f2328;
+        --muted: #656d76;
+        --accent: #2f6feb;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 16px;
+      font: 13px/1.5 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .badge-icon {
+      width: 34px;
+      height: 34px;
+      border-radius: 10px;
+      display: grid;
+      place-items: center;
+      color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 14%, transparent);
+      border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+      flex: none;
+    }
+    h1 { font-size: 15px; margin: 0; font-weight: 650; }
+    .sub { font-size: 12px; color: var(--muted); margin: 2px 0 0; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 9px;
+      border-radius: 999px;
+      font-size: 11px;
+      border: 1px solid var(--border);
+      background: var(--card);
+      white-space: nowrap;
+    }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); }
+    .dot.ok { background: var(--ok); }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      margin-bottom: 12px;
+      overflow: hidden;
+    }
+    .card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      font-weight: 600;
+      font-size: 12.5px;
+      border-bottom: 1px solid var(--border);
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 14px;
+      border-top: 1px solid var(--border);
+    }
+    .row:first-child, .card-head + .row { border-top: 0; }
+    .row-label { font-weight: 500; }
+    .row-help { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+    select, button {
+      font: inherit;
+      color: inherit;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 5px 10px;
+      cursor: pointer;
+    }
+    button:hover { border-color: var(--accent); }
+    button.ghost {
+      background: transparent;
+      border-color: transparent;
+      color: var(--muted);
+      padding: 3px 7px;
+      font-size: 12px;
+    }
+    button.ghost:hover { color: var(--fg); background: color-mix(in srgb, var(--fg) 8%, transparent); }
+    .file-list { max-height: 320px; overflow-y: auto; }
+    .file-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 8px 14px;
+      border-top: 1px solid var(--border);
+    }
+    .file-item:first-child { border-top: 0; }
+    .file-meta { min-width: 0; flex: 1; }
+    .file-name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-path { font: 11px/1.4 Consolas, monospace; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-actions { display: flex; gap: 4px; flex: none; }
+    .file-actions button { padding: 3px 8px; font-size: 11.5px; }
+    .empty { padding: 14px; color: var(--muted); font-size: 12px; text-align: center; }
+    .toast {
+      position: fixed;
+      left: 50%;
+      bottom: 14px;
+      transform: translateX(-50%);
+      padding: 6px 12px;
+      border-radius: 8px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+      font-size: 12px;
+      opacity: 0;
+      transition: opacity 0.15s;
+      pointer-events: none;
+    }
+    .toast.show { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="title">
+      <div class="badge-icon">
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M13 3.5H6.5A1.5 1.5 0 0 0 5 5v14a1.5 1.5 0 0 0 1.5 1.5h7M13 3.5l5 5h-5z"/>
+          <path d="m14 12 6.5 4.1-3.3.9-1.4 3.2z"/>
+        </svg>
+      </div>
+      <div>
+        <h1>文件与链接操作 · File Actions</h1>
+        <p class="sub">在聊天文件引用 / 链接上右键即可呼出菜单</p>
+      </div>
+    </div>
+    <span class="pill"><span class="dot" id="status-dot"></span><span id="status-text">检测中…</span></span>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <span>菜单与预览设置</span>
+      <button type="button" class="ghost" id="btn-reset">恢复默认</button>
+    </div>
+    <div class="row">
+      <div>
+        <div class="row-label">菜单显示</div>
+        <div class="row-help">精简模式仅保留常用打开、定位、复制与另存</div>
+      </div>
+      <select id="sel-menu-mode">
+        <option value="full">完整菜单</option>
+        <option value="compact">精简菜单</option>
+      </select>
+    </div>
+    <div class="row">
+      <div>
+        <div class="row-label">引用前后文</div>
+        <div class="row-help">查看行号引用上下文时显示的前后行数</div>
+      </div>
+      <select id="sel-context-lines">
+        <option value="4">前后各 4 行</option>
+        <option value="8">前后各 8 行</option>
+        <option value="16">前后各 16 行</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <span>首选应用（按扩展名）</span>
+      <button type="button" class="ghost" id="btn-clear-prefs">全部清除</button>
+    </div>
+    <div id="prefs-list"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <span>当前会话产出与工作区文件</span>
+      <button type="button" class="ghost" id="btn-refresh">刷新</button>
+    </div>
+    <div class="row" style="padding: 8px 14px;">
+      <div class="file-path" id="cwd-label">工作区：读取中…</div>
+    </div>
+    <div class="file-list" id="recent-list"></div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let currentSettings = { clientSettings: { menuMode: 'full', contextLines: 8, glass: 'on' }, preferredApps: {} };
+    let toastTimer = 0;
+
+    function showToast(msg) {
+      const el = $('toast');
+      el.textContent = msg;
+      el.classList.add('show');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => el.classList.remove('show'), 1800);
+    }
+
+    async function savePatch(patch) {
+      const res = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch)
+      }).then((r) => r.json());
+      if (res?.ok && res.settings) {
+        currentSettings = res.settings;
+        renderSettings();
+        showToast('设置已保存并同步');
+      }
+    }
+
+    function renderSettings() {
+      const cs = currentSettings.clientSettings || {};
+      $('sel-menu-mode').value = cs.menuMode === 'compact' ? 'compact' : 'full';
+      $('sel-context-lines').value = String([4, 8, 16].includes(Number(cs.contextLines)) ? cs.contextLines : 8);
+
+      const prefs = currentSettings.preferredApps || {};
+      const entries = Object.entries(prefs).filter(([k, v]) => k && v);
+      const container = $('prefs-list');
+      container.textContent = '';
+      if (!entries.length) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = '尚未设置首选应用（可在右键菜单「打开方式」中点击星标设置）';
+        container.appendChild(empty);
+        return;
+      }
+      for (const [ext, appId] of entries) {
+        const row = document.createElement('div');
+        row.className = 'row';
+        const info = document.createElement('div');
+        info.className = 'file-meta';
+        const label = document.createElement('div');
+        label.className = 'row-label';
+        label.textContent = ext === '[no extension]' ? '无扩展名' : '.' + ext.replace(/^\./, '');
+        const sub = document.createElement('div');
+        sub.className = 'file-path';
+        sub.textContent = appId.replace(/^exe:/, '');
+        info.append(label, sub);
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'ghost';
+        btn.textContent = '取消';
+        btn.addEventListener('click', () => {
+          const next = { ...prefs };
+          delete next[ext];
+          void savePatch({ preferredApps: next });
+        });
+        row.append(info, btn);
+        container.appendChild(row);
+      }
+    }
+
+    async function doAction(action, absPath) {
+      const res = await fetch('/api/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, path: absPath })
+      }).then((r) => r.json());
+      if (!res?.ok) showToast('操作失败');
+    }
+
+    async function loadStatus() {
+      try {
+        const data = await fetch('/api/status', { cache: 'no-store' }).then((r) => r.json());
+        if (!data?.ok) return;
+        const active = Boolean(data.loader?.active);
+        $('status-dot').classList.toggle('ok', active);
+        $('status-text').textContent = active ? '注入已激活' : '未注入（需运行 install.ps1）';
+        $('cwd-label').textContent = '工作区：' + (data.session?.cwd || '未关联');
+        if (data.settings) {
+          currentSettings = data.settings;
+          renderSettings();
+        }
+        const list = $('recent-list');
+        list.textContent = '';
+        const files = data.recentFiles || [];
+        if (!files.length) {
+          const empty = document.createElement('div');
+          empty.className = 'empty';
+          empty.textContent = '当前会话暂无扫描到的近期文件';
+          list.appendChild(empty);
+          return;
+        }
+        for (const f of files) {
+          const item = document.createElement('div');
+          item.className = 'file-item';
+          const meta = document.createElement('div');
+          meta.className = 'file-meta';
+          const name = document.createElement('div');
+          name.className = 'file-name';
+          name.textContent = f.name;
+          name.title = f.absolutePath;
+          const p = document.createElement('div');
+          p.className = 'file-path';
+          p.textContent = `[${f.source}] ${f.relativePath}`;
+          p.title = f.absolutePath;
+          meta.append(name, p);
+
+          const actions = document.createElement('div');
+          actions.className = 'file-actions';
+          const bOpen = document.createElement('button');
+          bOpen.type = 'button';
+          bOpen.textContent = '打开';
+          bOpen.addEventListener('click', () => void doAction('open', f.absolutePath));
+
+          const bRev = document.createElement('button');
+          bRev.type = 'button';
+          bRev.textContent = '定位';
+          bRev.addEventListener('click', () => void doAction('reveal', f.absolutePath));
+
+          const bCopy = document.createElement('button');
+          bCopy.type = 'button';
+          bCopy.textContent = '复制路径';
+          bCopy.addEventListener('click', async () => {
+            try {
+              await navigator.clipboard.writeText(f.absolutePath);
+              showToast('路径已复制');
+            } catch {
+              showToast('复制失败');
+            }
+          });
+
+          actions.append(bOpen, bRev, bCopy);
+          item.append(meta, actions);
+          list.appendChild(item);
+        }
+      } catch {
+        $('status-text').textContent = '连接失败';
+      }
+    }
+
+    $('sel-menu-mode').addEventListener('change', (e) => {
+      void savePatch({ clientSettings: { ...currentSettings.clientSettings, menuMode: e.target.value } });
+    });
+    $('sel-context-lines').addEventListener('change', (e) => {
+      void savePatch({ clientSettings: { ...currentSettings.clientSettings, contextLines: Number(e.target.value) } });
+    });
+    $('btn-reset').addEventListener('click', () => {
+      void savePatch({ clientSettings: { menuMode: 'full', contextLines: 8, glass: 'on' } });
+    });
+    $('btn-clear-prefs').addEventListener('click', () => {
+      void savePatch({ preferredApps: {} });
+    });
+    $('btn-refresh').addEventListener('click', () => void loadStatus());
+
+    void loadStatus();
+  </script>
+</body>
+</html>
