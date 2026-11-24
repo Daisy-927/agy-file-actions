@@ -44,7 +44,7 @@
 在项目根目录执行：
 
 ```powershell
-# 安装（将插件链接到 ~/.gemini/config/plugins/agy-file-actions，并在 resources/app/index.cjs 追加共存加载块）
+# 安装（将插件复制到 ~/.gemini/config/plugins/agy-file-actions，并在 resources/app/index.cjs 追加共存加载块）
 pwsh ./install.ps1
 
 # 卸载

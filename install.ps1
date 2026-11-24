@@ -141,23 +141,26 @@ if ($Uninstall) {
   exit 0
 }
 
-# 1. Link workspace repo to ~/.gemini/config/plugins/agy-file-actions via NTFS Junction
+# 1. Stage plugin files as a real directory under ~/.gemini/config/plugins/agy-file-actions
+#    (Antigravity's plugin scanner skips NTFS Junctions / symlinks, so a regular directory is required
+#    for the plugin and its Sidecar UI panel to appear in the Antigravity sidebar.)
 New-Item -ItemType Directory -Force -Path $PluginsDir | Out-Null
 if (Test-Path $TargetPluginDir) {
   $item = Get-Item $TargetPluginDir -Force
   if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-    $currentTarget = ($item.Target | Select-Object -First 1)
-    if ($currentTarget -ne $RepoRoot) {
-      [IO.Directory]::Delete($TargetPluginDir)
-      New-Item -ItemType Junction -Path $TargetPluginDir -Target $RepoRoot | Out-Null
-    }
+    [IO.Directory]::Delete($TargetPluginDir)
   } else {
-    throw "Target plugin path already exists as a regular folder: $TargetPluginDir. Move or remove it first."
+    Remove-Item -Path $TargetPluginDir -Recurse -Force
   }
-} else {
-  New-Item -ItemType Junction -Path $TargetPluginDir -Target $RepoRoot | Out-Null
 }
-Write-Output "[agy-file-actions] Linked plugin: $TargetPluginDir -> $RepoRoot"
+New-Item -ItemType Directory -Force -Path $TargetPluginDir | Out-Null
+foreach ($sub in @("assets", "scripts", "sidecars", "vendor", "LICENSE", "NOTICE.md", "package.json", "plugin.json", "README.md")) {
+  $src = Join-Path $RepoRoot $sub
+  if (Test-Path $src) {
+    Copy-Item -Path $src -Destination $TargetPluginDir -Recurse -Force
+  }
+}
+Write-Output "[agy-file-actions] Installed plugin directory: $TargetPluginDir"
 
 # 2. Register loader in <Antigravity>/resources/app/index.cjs
 if (-not $resolvedAgy) {
