@@ -121,7 +121,8 @@ node --no-warnings ./scripts/runtime-injector.mjs
 - `vendor/dsh-file-actions-client.js`：复用自 `jidekaixin2dian/dsh-file-actions`（MIT，保持上游核心不变）
 - `scripts/agy-file-actions-overlay.js`：Antigravity 主题适配（支持浅色/深色及 `oklch` 颜色变量）、DOM 载体识别增强与零轮询主进程 RPC 桥接
 - `scripts/windows-file-ops.mjs`：Windows 文件定位、`conversation_summaries.db` 工作区与 `brain/` 目录解析、分块读取、`reg.exe` 关联应用与图标查询
-- `scripts/electron-overlay-loader.cjs`：Electron 主进程加载器与沙盒浏览器预览服务
+- `scripts/electron-overlay-loader.cjs`：Electron 主进程加载器
+- `scripts/preview-server.mjs`：本地沙盒 HTML / SVG / 媒体预览 HTTP 服务（Electron 与 CDP 模式共用）
 - `scripts/runtime-injector.mjs`：CDP 模式注入脚本
 - `sidecars/panel/`：Antigravity Sidecar 设置与近期文件面板
 - `test/`：单元测试与无头 Edge E2E 测试

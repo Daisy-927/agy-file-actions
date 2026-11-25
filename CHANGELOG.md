@@ -2,6 +2,17 @@
 
 All notable changes to `agy-file-actions` are documented in this file.
 
+## [0.1.2] - 2026-11-25
+
+### Fixed
+- Fixed the broken `"信任此文件，启用脚本与联网"` action in the sandboxed HTML/SVG preview window caused by double quotes inside an inline `onclick` attribute (`scripts/preview-server.mjs`).
+
+### Security
+- Blocked Windows UNC network paths (`\\host\share`, `//host/share`), extended/device namespace paths (`\\?\`, `\\.\`), and remote `file://host/...` URIs from being resolved or opened (`scripts/windows-file-ops.mjs`, `scripts/agy-file-actions-overlay.js`).
+- Extracted the sandboxed HTTP preview server into `scripts/preview-server.mjs` and wired `scripts/runtime-injector.mjs` (`previewInBrowser`) to open sandboxed preview URLs instead of raw HTML/SVG files directly; added `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and wrapper CSP headers.
+- Hardened `sidecars/panel/server.mjs` with `fs.realpathSync.native()` root containment checks (preventing symlink/junction escapes), `Content-Security-Policy` (`frame-ancestors`), `X-Content-Type-Options: nosniff`, and `X-AGY-FA-Token` enforcement on `GET /api/status` and `GET /api/settings` (updated `sidecars/panel/ui.html` accordingly).
+- Fixed `install.ps1` loader path escaping via `ConvertTo-Json` so paths containing apostrophes generate valid JavaScript, and removed the unused HTTP `/api/rpc` fallback branch in `scripts/agy-file-actions-overlay.js`.
+
 ## [0.1.1] - 2026-11-25
 
 ### Security

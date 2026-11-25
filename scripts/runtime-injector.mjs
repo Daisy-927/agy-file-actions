@@ -16,6 +16,7 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import {
   discoverApplications,
+  isBlockedNetworkOrDevicePath,
   launchApplication,
   listDir,
   loadSettings,
@@ -26,6 +27,7 @@ import {
   saveSettings,
   statFile
 } from './windows-file-ops.mjs';
+import { createPreviewServer } from './preview-server.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, '..');
@@ -152,12 +154,28 @@ const shellFallback = {
   }
 };
 
-async function handleRpc(req) {
+function openPreviewUrlInBrowser(previewUrl) {
+  if (!/^https?:\/\/127\.0\.0\.1:\d+\//i.test(String(previewUrl || ''))) return false;
+  if (process.platform === 'win32') {
+    const child = spawn('explorer.exe', [previewUrl], {
+      detached: true,
+      stdio: 'ignore'
+    });
+    child.unref();
+    return true;
+  }
+  return false;
+}
+
+const previewServer = createPreviewServer();
+
+export async function handleRpc(req, targetUrl = '', options = {}) {
   const method = req?.method;
   const params = req?.params || {};
   const cid = req?.conversationId || params?.sessionId || '';
-  const pageUrl = req?.pageUrl || '';
+  const pageUrl = targetUrl || req?.pageUrl || '';
   const ctx = resolveConversationContext(cid, pageUrl);
+  const shellApi = options.shell || shellFallback;
 
   if (method === 'getSession') return { id: ctx.id, cwd: ctx.cwd, roots: ctx.roots, outsideProject: ctx.outsideProject };
   if (method === 'getSettings') return loadSettings();
@@ -170,19 +188,34 @@ async function handleRpc(req) {
     const absPath = st.ok ? st.value.absolutePath : (resolveCandidatePaths(params.path, ctx.roots)[0] || params.path);
     return { ok: true, value: await discoverApplications(absPath) };
   }
-  if (method === 'open' || method === 'previewInBrowser') {
+  if (method === 'open') {
     const st = await statFile(ctx, params.path);
     const absPath = st.ok ? st.value.absolutePath : (resolveCandidatePaths(params.path, ctx.roots)[0] || params.path);
-    const ok = await launchApplication(absPath, method === 'open' ? params.appId : undefined, shellFallback);
+    const ok = await launchApplication(absPath, params.appId, shellApi);
     return ok ? { ok: true, value: { opened: true } } : { ok: false };
+  }
+  if (method === 'previewInBrowser') {
+    const st = await statFile(ctx, params.path);
+    const absPath = st.ok ? st.value.absolutePath : (resolveCandidatePaths(params.path, ctx.roots)[0] || '');
+    if (!absPath || isBlockedNetworkOrDevicePath(absPath) || !fs.existsSync(absPath)) {
+      return { ok: false };
+    }
+    const item = await previewServer.registerItem(absPath);
+    if (!item) return { ok: false };
+    const opened = options.openUrl ? await options.openUrl(item.previewUrl) : openPreviewUrlInBrowser(item.previewUrl);
+    return opened ? { ok: true, value: { opened: true, previewUrl: item.previewUrl } } : { ok: false };
   }
   if (method === 'reveal') {
     const st = await statFile(ctx, params.path);
     const absPath = st.ok ? st.value.absolutePath : (resolveCandidatePaths(params.path, ctx.roots)[0] || params.path);
-    const ok = await revealInExplorer(absPath, shellFallback);
+    const ok = await revealInExplorer(absPath, shellApi);
     return ok ? { ok: true, value: { revealed: true } } : { ok: false };
   }
   throw new Error(`Unknown RPC method: ${method}`);
+}
+
+export async function closePreviewServer() {
+  await previewServer.close();
 }
 
 async function attachTarget(target) {
@@ -213,7 +246,7 @@ async function attachTarget(target) {
         batch.map(async (req) => {
           if (!req?.id) return;
           try {
-            const payload = await handleRpc(req);
+            const payload = await handleRpc(req, target.url);
             await cdp.call('Runtime.evaluate', {
               expression: `globalThis.__AGY_FA_BRIDGE__?.deliverResponse(${JSON.stringify(req.id)}, true, ${JSON.stringify(payload)})`
             });
@@ -270,7 +303,9 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error(`[agy-file-actions] ${err.message}`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    console.error(`[agy-file-actions] ${err.message}`);
+    process.exitCode = 1;
+  });
+}

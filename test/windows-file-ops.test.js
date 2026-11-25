@@ -8,6 +8,9 @@ import { DatabaseSync } from 'node:sqlite';
 import {
   discoverApplications,
   expandWinEnv,
+  isAbsoluteFsPath,
+  isBlockedNetworkOrDevicePath,
+  launchApplication,
   listDir,
   listRecentFiles,
   parseCommandTemplate,
@@ -15,6 +18,7 @@ import {
   readFileBytes,
   resolveCandidatePaths,
   resolveConversationContext,
+  revealInExplorer,
   statFile
 } from '../scripts/windows-file-ops.mjs';
 
@@ -146,4 +150,25 @@ test('discoverApplications returns real Windows apps quickly for .jsonl and .md'
   assert.ok(elapsed < 5000, `discoverApplications took too long: ${elapsed}ms`);
   assert.ok(jsonlApps.length > 0, 'Expected at least one Windows app for .jsonl');
   assert.ok(mdApps.length > 0, 'Expected at least one Windows app for .md');
+});
+
+test('blocks UNC network paths, device paths, and remote file:// URIs', async () => {
+  assert.equal(isBlockedNetworkOrDevicePath('\\\\evil\\share\\secret.txt'), true);
+  assert.equal(isBlockedNetworkOrDevicePath('//evil/share/secret.txt'), true);
+  assert.equal(isBlockedNetworkOrDevicePath('\\\\?\\C:\\Windows\\win.ini'), true);
+  assert.equal(isBlockedNetworkOrDevicePath('\\\\.\\pipe\\test'), true);
+  assert.equal(isBlockedNetworkOrDevicePath('file://evil/share/secret.txt'), true);
+  assert.equal(isBlockedNetworkOrDevicePath('file:///C:/workspace/a.txt'), false);
+  assert.equal(isBlockedNetworkOrDevicePath('file://localhost/C:/workspace/a.txt'), false);
+
+  assert.equal(isAbsoluteFsPath('\\\\evil\\share\\secret.txt'), false);
+  assert.equal(isAbsoluteFsPath('//evil/share/secret.txt'), false);
+  assert.equal(isAbsoluteFsPath('C:\\workspace\\a.txt'), true);
+
+  assert.deepEqual(resolveCandidatePaths('\\\\evil\\share\\secret.txt', ['D:\\ws']), []);
+  assert.deepEqual(resolveCandidatePaths('//evil/share/secret.txt', ['D:\\ws']), []);
+  assert.deepEqual(resolveCandidatePaths('file://evil/share/secret.txt', ['D:\\ws']), []);
+
+  assert.equal(await launchApplication('\\\\evil\\share\\secret.txt'), false);
+  assert.equal(await revealInExplorer('//evil/share/secret.txt'), false);
 });

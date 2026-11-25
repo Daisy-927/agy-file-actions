@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   STATUS_FILE,
+  isBlockedNetworkOrDevicePath,
   launchApplication,
   listRecentFiles,
   loadSettings,
@@ -98,10 +99,23 @@ function readLoaderStatus() {
 }
 
 function isInsideAnyRoot(absPath, roots) {
-  const normTarget = path.resolve(absPath).toLowerCase();
+  if (!absPath || isBlockedNetworkOrDevicePath(absPath)) return false;
+  let realTarget;
+  try {
+    realTarget = fs.realpathSync.native(absPath);
+    if (!fs.statSync(realTarget).isFile()) return false;
+  } catch {
+    return false;
+  }
+  const normTarget = process.platform === 'win32' ? realTarget.toLowerCase() : realTarget;
   return (roots || []).some((root) => {
-    const normRoot = path.resolve(root).replace(/[\\/]+$/, '').toLowerCase();
-    return normTarget === normRoot || normTarget.startsWith(`${normRoot}${path.sep}`);
+    try {
+      const realRoot = fs.realpathSync.native(root).replace(/[\\/]+$/, '');
+      const normRoot = process.platform === 'win32' ? realRoot.toLowerCase() : realRoot;
+      return normTarget === normRoot || normTarget.startsWith(`${normRoot}${path.sep}`);
+    } catch {
+      return false;
+    }
   });
 }
 
@@ -156,7 +170,10 @@ const server = http.createServer(async (req, res) => {
       const html = rawHtml.replace('__AGY_FA_TOKEN__', SIDECAR_TOKEN);
       res.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
-        'Cache-Control': 'no-store, max-age=0'
+        'Cache-Control': 'no-store, max-age=0',
+        'X-Content-Type-Options': 'nosniff',
+        'Referrer-Policy': 'no-referrer',
+        'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors https://127.0.0.1:* http://127.0.0.1:* https://localhost:* http://localhost:*"
       });
       res.end(html);
       return;
@@ -173,6 +190,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === '/api/status') {
+      if (!hasValidToken(req)) {
+        sendJson(res, 403, { ok: false, error: 'Invalid or missing token' });
+        return;
+      }
       const loader = readLoaderStatus();
       const cid = url.searchParams.get('conversationId') || loader.conversationId || process.env.ANTIGRAVITY_CONVERSATION_ID || '';
       const ctx = resolveConversationContext(cid, loader.url || '');
@@ -189,6 +210,10 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname === '/api/settings') {
       if (req.method === 'GET') {
+        if (!hasValidToken(req)) {
+          sendJson(res, 403, { ok: false, error: 'Invalid or missing token' });
+          return;
+        }
         sendJson(res, 200, { ok: true, settings: loadSettings() });
         return;
       }

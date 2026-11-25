@@ -40,6 +40,7 @@ function Resolve-AntigravityDir {
 $BeginMarker = "// BEGIN AGY_FILE_ACTIONS_LOADER"
 $EndMarker = "// END AGY_FILE_ACTIONS_LOADER"
 $LoaderJsPath = (Join-Path $TargetPluginDir "scripts\electron-overlay-loader.cjs") -replace '\\', '/'
+$LoaderJsPathJson = ConvertTo-Json -InputObject $LoaderJsPath -Compress
 
 function Remove-LoaderBlock {
   param([string]$IndexCjsPath)
@@ -58,7 +59,7 @@ function Ensure-LoaderBlock {
   $block = @"
 $BeginMarker
 try {
-  const _agyFileActionsLoader = '$LoaderJsPath';
+  const _agyFileActionsLoader = $LoaderJsPathJson;
   if (fs.existsSync(_agyFileActionsLoader)) {
     require(_agyFileActionsLoader);
   }
@@ -152,7 +153,7 @@ if (Test-Path $TargetPluginDir) {
   }
 }
 New-Item -ItemType Directory -Force -Path $TargetPluginDir | Out-Null
-foreach ($sub in @("assets", "scripts", "sidecars", "vendor", "LICENSE", "NOTICE.md", "package.json", "plugin.json", "README.md")) {
+foreach ($sub in @("assets", "scripts", "sidecars", "vendor", "CHANGELOG.md", "LICENSE", "NOTICE.md", "package.json", "plugin.json", "README.md")) {
   $src = Join-Path $RepoRoot $sub
   if (-not (Test-Path $src)) { continue }
   if (Test-Path $src -PathType Container) {

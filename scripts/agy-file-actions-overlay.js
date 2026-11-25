@@ -130,23 +130,6 @@
   }
 
   function callBackend(method, params = {}, timeoutMs = 15000) {
-    const mode = globalThis.__AGY_FILE_ACTIONS_RUNTIME_CONFIG__?.transport || 'electron';
-    const apiBase = globalThis.__AGY_FILE_ACTIONS_RUNTIME_CONFIG__?.apiBase || '';
-
-    if (mode === 'http' && apiBase) {
-      return fetch(`${apiBase.replace(/\/$/, '')}/api/rpc`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          method,
-          params,
-          conversationId: getConversationId(),
-          pageUrl: location.href
-        }),
-        signal: AbortSignal.timeout(timeoutMs)
-      }).then((r) => r.json());
-    }
-
     return new Promise((resolve, reject) => {
       const id = `r${++rpcState.seq}`;
       const timer = setTimeout(() => {
@@ -286,10 +269,12 @@
       } else {
         return '';
       }
+      const host = String(targetUrl.hostname || '').toLowerCase();
+      if (host && host !== 'localhost') {
+        return '';
+      }
       let fsPath = decodeURIComponent(targetUrl.pathname || '');
-      if (targetUrl.hostname) {
-        fsPath = `//${targetUrl.hostname}${fsPath}`;
-      } else if (/^\/[A-Za-z]:/.test(fsPath)) {
+      if (/^\/[A-Za-z]:/.test(fsPath)) {
         fsPath = fsPath.slice(1);
       }
       if (!fsPath) return '';
@@ -311,7 +296,9 @@
         const val = parsed.searchParams.get(key);
         if (val) {
           if (/^file:\/\//i.test(val)) return decodeFileUriWithHash(val);
-          if (/^(?:[A-Za-z]:[\\/]|\\\\[^\\]|\/)/.test(val)) return val;
+          const trimmed = String(val).trim();
+          if (/^(?:[\\/]{2}|[\\/]\?[\\/]|[\\/]\.[\\/])/.test(trimmed)) return '';
+          if (/^(?:[A-Za-z]:[\\/]|\/(?![\\/]))/.test(trimmed)) return trimmed;
         }
       }
       if (parsed.protocol === 'file:') return decodeFileUriWithHash(parsed.href);

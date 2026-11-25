@@ -12,6 +12,8 @@ import {
   readFileBytes,
   statFile
 } from '../scripts/windows-file-ops.mjs';
+import { createPreviewServer } from '../scripts/preview-server.mjs';
+import { closePreviewServer, handleRpc } from '../scripts/runtime-injector.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const EDGE_PATH = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
@@ -410,8 +412,25 @@ ${overlaySrc}
   }
 });
 
-test('Sidecar server serves UI with CSRF token, blocks CORS/unauthenticated POSTs, removes /api/rpc, and enforces 413', async () => {
+test('Sidecar server enforces CSRF token on GET/POST, CSP headers, symlink root check, removes /api/rpc, and enforces 413', async () => {
   const tmpAppData = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fa-sidecar-'));
+  const cid = '11111111-2222-3333-4444-555555555555';
+  const brainCidDir = path.join(tmpAppData, 'brain', cid);
+  const outsideDir = path.join(tmpAppData, 'outside');
+  const statusDir = path.join(tmpAppData, 'plugin_data', 'agy-file-actions');
+  fs.mkdirSync(brainCidDir, { recursive: true });
+  fs.mkdirSync(outsideDir, { recursive: true });
+  fs.mkdirSync(statusDir, { recursive: true });
+  const outsideFile = path.join(outsideDir, 'secret.txt');
+  fs.writeFileSync(outsideFile, 'top-secret', 'utf8');
+  const junctionDir = path.join(brainCidDir, 'escape-junction');
+  fs.symlinkSync(outsideDir, junctionDir, 'junction');
+  fs.writeFileSync(
+    path.join(statusDir, 'direct_loader_status.json'),
+    JSON.stringify({ active: true, conversationId: cid, url: `https://127.0.0.1:7255/c/${cid}` }),
+    'utf8'
+  );
+
   const sidecarPort = 28932 + Math.floor(Math.random() * 1000);
   const proc = spawn(process.execPath, ['--no-warnings', path.join(ROOT, 'sidecars', 'panel', 'server.mjs')], {
     env: {
@@ -433,6 +452,9 @@ test('Sidecar server serves UI with CSRF token, blocks CORS/unauthenticated POST
     const htmlRes = await fetch(`${base}/`);
     assert.equal(htmlRes.status, 200);
     assert.equal(htmlRes.headers.get('access-control-allow-origin'), null);
+    assert.equal(htmlRes.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(htmlRes.headers.get('referrer-policy'), 'no-referrer');
+    assert.match(htmlRes.headers.get('content-security-policy') || '', /frame-ancestors https:\/\/127\.0\.0\.1:\* http:\/\/127\.0\.0\.1:\*/);
     const html = await htmlRes.text();
     assert.match(html, /文件与链接操作/);
     const tokenMatch = /name="agy-fa-token" content="([0-9a-f]+)"/.exec(html);
@@ -449,9 +471,15 @@ test('Sidecar server serves UI with CSRF token, blocks CORS/unauthenticated POST
 
     // Cross-site / foreign Origin must be rejected
     const crossSiteRes = await fetch(`${base}/api/status`, {
-      headers: { Origin: 'https://evil.example', 'Sec-Fetch-Site': 'cross-site' }
+      headers: { Origin: 'https://evil.example', 'Sec-Fetch-Site': 'cross-site', 'X-AGY-FA-Token': token }
     });
     assert.equal(crossSiteRes.status, 403);
+
+    // GET /api/status and GET /api/settings without token must be rejected
+    const statusNoToken = await fetch(`${base}/api/status`);
+    assert.equal(statusNoToken.status, 403);
+    const settingsNoToken = await fetch(`${base}/api/settings`);
+    assert.equal(settingsNoToken.status, 403);
 
     // POST without token must be rejected
     const noTokenRes = await fetch(`${base}/api/settings`, {
@@ -469,7 +497,15 @@ test('Sidecar server serves UI with CSRF token, blocks CORS/unauthenticated POST
     });
     assert.equal(tooLargeRes.status, 413);
 
-    // Valid token succeeds
+    // Junction/symlink escaping active root must be blocked with 403
+    const symlinkEscapeRes = await fetch(`${base}/api/action`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-AGY-FA-Token': token },
+      body: JSON.stringify({ action: 'open', path: path.join(junctionDir, 'secret.txt') })
+    });
+    assert.equal(symlinkEscapeRes.status, 403);
+
+    // Valid token succeeds on POST /api/settings, GET /api/settings, and GET /api/status
     const saved = await (await fetch(`${base}/api/settings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-AGY-FA-Token': token },
@@ -479,11 +515,83 @@ test('Sidecar server serves UI with CSRF token, blocks CORS/unauthenticated POST
     assert.equal(saved.settings.clientSettings.menuMode, 'compact');
     assert.equal(saved.settings.clientSettings.contextLines, 16);
 
-    const status = await (await fetch(`${base}/api/status`)).json();
+    const gotSettings = await (await fetch(`${base}/api/settings`, {
+      headers: { 'X-AGY-FA-Token': token }
+    })).json();
+    assert.equal(gotSettings.ok, true);
+    assert.equal(gotSettings.settings.clientSettings.menuMode, 'compact');
+
+    const status = await (await fetch(`${base}/api/status`, {
+      headers: { 'X-AGY-FA-Token': token }
+    })).json();
     assert.equal(status.ok, true);
     assert.equal(status.settings.clientSettings.menuMode, 'compact');
   } finally {
     try { proc.kill(); } catch {}
     fs.rmSync(tmpAppData, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
   }
+});
+
+test('preview-server renders valid trust link without onclick truncation and sets nosniff/CSP', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fa-preview-'));
+  const htmlFile = path.join(tmp, 'demo.html');
+  fs.writeFileSync(htmlFile, '<h1>Hi</h1><script>window.__test=1</script>', 'utf8');
+  const preview = createPreviewServer();
+  try {
+    const item = await preview.registerItem(htmlFile);
+    assert.ok(item?.previewUrl);
+
+    const res = await fetch(item.previewUrl);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(res.headers.get('referrer-policy'), 'no-referrer');
+    assert.match(res.headers.get('content-security-policy') || '', /frame-src 'self'/);
+    const body = await res.text();
+    assert.doesNotMatch(body, /onclick=/);
+    const linkMatch = /<a class="trust-btn" href="([^"]+)"/.exec(body);
+    assert.ok(linkMatch, 'Expected valid <a class="trust-btn"> trust link');
+
+    const trustedPath = linkMatch[1].replaceAll('&amp;', '&');
+    assert.match(trustedPath, /trusted=1/);
+    const origin = new URL(item.previewUrl).origin;
+    const trustedRes = await fetch(`${origin}${trustedPath}`);
+    assert.equal(trustedRes.status, 200);
+    const trustedBody = await trustedRes.text();
+    assert.match(trustedBody, /sandbox="allow-scripts allow-forms allow-downloads allow-popups"/);
+
+    const rawRes = await fetch(`${origin}/raw?token=${new URL(item.previewUrl).searchParams.get('token')}&id=${item.id}`);
+    assert.equal(rawRes.status, 200);
+    assert.match(rawRes.headers.get('content-security-policy') || '', /default-src 'none'/);
+  } finally {
+    await preview.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('runtime-injector previewInBrowser opens shared sandboxed preview URL instead of raw file', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fa-cdp-preview-'));
+  const htmlFile = path.join(tmp, 'report.html');
+  fs.writeFileSync(htmlFile, '<p>Report</p>', 'utf8');
+  let openedUrl = '';
+  try {
+    const res = await handleRpc(
+      { method: 'previewInBrowser', params: { path: htmlFile }, conversationId: '11111111-2222-3333-4444-555555555555' },
+      'https://127.0.0.1:7255/c/11111111-2222-3333-4444-555555555555',
+      { openUrl: (url) => { openedUrl = url; return true; } }
+    );
+    assert.equal(res.ok, true);
+    assert.match(openedUrl, /^http:\/\/127\.0\.0\.1:\d+\/preview\?token=/);
+    const previewRes = await fetch(openedUrl);
+    assert.equal(previewRes.status, 200);
+  } finally {
+    await closePreviewServer();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('install.ps1 uses ConvertTo-Json to safely quote loader paths containing apostrophes', () => {
+  const ps1 = fs.readFileSync(path.join(ROOT, 'install.ps1'), 'utf8');
+  assert.match(ps1, /ConvertTo-Json\s+-InputObject\s+\$LoaderJsPath\s+-Compress/);
+  assert.match(ps1, /const _agyFileActionsLoader = \$LoaderJsPathJson;/);
+  assert.doesNotMatch(ps1, /const _agyFileActionsLoader = '\$LoaderJsPath';/);
 });

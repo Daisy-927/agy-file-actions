@@ -118,8 +118,28 @@ export function saveSettings(patch) {
   return next;
 }
 
+export function isBlockedNetworkOrDevicePath(rawPath) {
+  const cleaned = String(rawPath || '').trim().replace(/^['"]+|['"]+$/g, '');
+  if (!cleaned) return false;
+  // Block Windows UNC paths (\\host\share, //host/share), extended/device paths (\\?\, \\.\)
+  if (/^(?:[\\/]{2}|[\\/]\?[\\/]|[\\/]\.[\\/])/.test(cleaned)) {
+    return true;
+  }
+  if (/^file:/i.test(cleaned)) {
+    try {
+      const parsed = new URL(cleaned);
+      const host = String(parsed.hostname || '').toLowerCase();
+      if (host && host !== 'localhost') return true;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function isAbsoluteFsPath(value) {
-  return /^(?:[A-Za-z]:[\\/]|\\\\[^\\]|\/)/.test(String(value || ''));
+  if (isBlockedNetworkOrDevicePath(value)) return false;
+  return /^(?:[A-Za-z]:[\\/]|\/(?![\\/]))/.test(String(value || '').trim());
 }
 
 export function sanitizeConversationId(conversationId) {
@@ -236,7 +256,7 @@ export function resolveConversationContext(conversationId, pageUrl = '', options
 
 export function resolveCandidatePaths(rawPath, roots = []) {
   let cleaned = String(rawPath || '').trim().replace(/^['"]+|['"]+$/g, '');
-  if (!cleaned) return [];
+  if (!cleaned || isBlockedNetworkOrDevicePath(cleaned)) return [];
 
   if (cleaned === '~' || cleaned.startsWith('~/') || cleaned.startsWith('~\\')) {
     cleaned = path.join(USER_HOME, cleaned.slice(1).replace(/^[\\/]+/, ''));
@@ -794,7 +814,7 @@ export async function discoverApplications(absPath, options = {}) {
 }
 
 export async function launchApplication(absPath, appId, shellApi) {
-  if (!absPath) return false;
+  if (!absPath || isBlockedNetworkOrDevicePath(absPath)) return false;
   if (!appId) {
     if (shellApi && typeof shellApi.openPath === 'function') {
       const errMsg = await shellApi.openPath(path.normalize(absPath));
@@ -834,7 +854,7 @@ export async function launchApplication(absPath, appId, shellApi) {
 }
 
 export async function revealInExplorer(absPath, shellApi) {
-  if (!absPath) return false;
+  if (!absPath || isBlockedNetworkOrDevicePath(absPath)) return false;
   const normalized = path.normalize(absPath);
   try {
     if (shellApi && typeof shellApi.showItemInFolder === 'function') {

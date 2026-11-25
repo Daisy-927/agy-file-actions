@@ -24,9 +24,7 @@
   // Tell sidecar not to spawn CDP fallback injector when direct Electron loader is active
   process.env.AGY_FILE_ACTIONS_DIRECT_LOADER = '1';
 
-  const crypto = require('node:crypto');
   const fs = require('node:fs');
-  const http = require('node:http');
   const Module = require('node:module');
   const path = require('node:path');
   const { pathToFileURL } = require('node:url');
@@ -35,6 +33,7 @@
   const VENDOR_CLIENT_FILE = path.join(ROOT_DIR, 'vendor', 'dsh-file-actions-client.js');
   const OVERLAY_FILE = path.join(ROOT_DIR, 'scripts', 'agy-file-actions-overlay.js');
   const OPS_MODULE_URL = pathToFileURL(path.join(ROOT_DIR, 'scripts', 'windows-file-ops.mjs')).href;
+  const PREVIEW_MODULE_URL = pathToFileURL(path.join(ROOT_DIR, 'scripts', 'preview-server.mjs')).href;
   const APP_DATA_DIR = process.env.ANTIGRAVITY_APP_DATA_DIR
     ? path.resolve(process.env.ANTIGRAVITY_APP_DATA_DIR)
     : path.join(process.env.USERPROFILE || process.env.HOME || '', '.gemini', 'antigravity');
@@ -119,155 +118,21 @@ ${overlaySrc}
 
   /* ───────────────────── Sandboxed Browser Preview ───────────────────── */
 
-  const PREVIEW_TOKEN = crypto.randomBytes(24).toString('hex');
-  const PREVIEW_MIME = {
-    html: 'text/html; charset=utf-8',
-    htm: 'text/html; charset=utf-8',
-    xhtml: 'application/xhtml+xml; charset=utf-8',
-    svg: 'image/svg+xml',
-    pdf: 'application/pdf',
-    md: 'text/plain; charset=utf-8',
-    markdown: 'text/plain; charset=utf-8',
-    mdx: 'text/plain; charset=utf-8',
-    txt: 'text/plain; charset=utf-8',
-    json: 'text/plain; charset=utf-8',
-    jsonl: 'text/plain; charset=utf-8',
-    png: 'image/png',
-    jpg: 'image/jpeg',
-    jpeg: 'image/jpeg',
-    gif: 'image/gif',
-    webp: 'image/webp',
-    bmp: 'image/bmp',
-    ico: 'image/x-icon',
-    avif: 'image/avif',
-    mp4: 'video/mp4',
-    m4v: 'video/mp4',
-    mov: 'video/quicktime',
-    webm: 'video/webm',
-    ogv: 'video/ogg',
-    mp3: 'audio/mpeg',
-    wav: 'audio/wav',
-    flac: 'audio/flac',
-    m4a: 'audio/mp4',
-    ogg: 'audio/ogg',
-    oga: 'audio/ogg',
-    opus: 'audio/ogg'
-  };
-  const previewItems = new Map();
-  let previewServer = null;
-  let previewPort = 0;
-
-  function verifyPreviewToken(provided) {
-    const token = String(provided || '');
-    if (token.length !== PREVIEW_TOKEN.length) return false;
-    try {
-      return crypto.timingSafeEqual(Buffer.from(token, 'utf8'), Buffer.from(PREVIEW_TOKEN, 'utf8'));
-    } catch {
-      return false;
+  let previewServerPromise = null;
+  function getPreviewServer() {
+    if (!previewServerPromise) {
+      previewServerPromise = import(PREVIEW_MODULE_URL).then((mod) => mod.createPreviewServer());
     }
-  }
-
-  function ensurePreviewServer() {
-    if (previewServer && previewPort) return Promise.resolve(previewPort);
-    return new Promise((resolve, reject) => {
-      const server = http.createServer((req, res) => {
-        try {
-          const url = new URL(req.url || '/', 'http://127.0.0.1');
-          if (!verifyPreviewToken(url.searchParams.get('token'))) {
-            res.writeHead(403);
-            res.end('Forbidden');
-            return;
-          }
-          const id = url.searchParams.get('id') || '';
-          const entry = previewItems.get(id);
-          if (!entry || !fs.existsSync(entry.absPath)) {
-            res.writeHead(404);
-            res.end('Not found');
-            return;
-          }
-          const ext = path.extname(entry.absPath).slice(1).toLowerCase();
-          const mime = PREVIEW_MIME[ext] || 'application/octet-stream';
-          const isActiveHtmlOrSvg = ['html', 'htm', 'xhtml', 'svg'].includes(ext);
-
-          if (url.pathname === '/preview') {
-            if (!isActiveHtmlOrSvg) {
-              const rawUrl = `/raw?token=${encodeURIComponent(PREVIEW_TOKEN)}&id=${encodeURIComponent(id)}`;
-              res.writeHead(302, { Location: rawUrl });
-              res.end();
-              return;
-            }
-            const trusted = url.searchParams.get('trusted') === '1';
-            const rawUrl = `/raw?token=${encodeURIComponent(PREVIEW_TOKEN)}&id=${encodeURIComponent(id)}${trusted ? '&trusted=1' : ''}`;
-            const trustedUrl = `/preview?token=${encodeURIComponent(PREVIEW_TOKEN)}&id=${encodeURIComponent(id)}&trusted=1`;
-            const bannerText = trusted
-              ? '已启用脚本与联网，仅对此预览有效'
-              : '安全预览：脚本与外部资源已关闭';
-            const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${escapeHtml(path.basename(entry.absPath))}</title>
-<style>body{margin:0;font:14px system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
-.bar{position:fixed;inset:0 0 auto;height:50px;box-sizing:border-box;padding:8px 14px;display:flex;gap:12px;align-items:center;background:#f2f2f2;color:#222;border-bottom:1px solid #ddd}
-.bar button{padding:5px 10px;border-radius:6px;border:1px solid #bbb;background:#fff;cursor:pointer;font:inherit}
-iframe{position:fixed;top:50px;left:0;width:100%;height:calc(100% - 50px);border:0;background:#fff}</style></head>
-<body><div class="bar"><span>${bannerText}</span>${trusted ? '' : `<button type="button" onclick="location.replace(${JSON.stringify(trustedUrl)})">信任此文件，启用脚本与联网</button>`}</div>
-<iframe sandbox="${trusted ? 'allow-scripts allow-forms allow-downloads allow-popups' : ''}" src="${rawUrl}"></iframe></body></html>`;
-            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-            res.end(html);
-            return;
-          }
-
-          if (url.pathname === '/raw') {
-            const st = fs.statSync(entry.absPath);
-            if (st.size > 64 * 1024 * 1024) {
-              res.writeHead(413);
-              res.end('File too large (>64 MiB)');
-              return;
-            }
-            const headers = {
-              'Content-Type': mime,
-              'Content-Length': st.size,
-              'Cache-Control': 'no-store'
-            };
-            if (isActiveHtmlOrSvg && url.searchParams.get('trusted') !== '1') {
-              headers['Content-Security-Policy'] = "default-src 'none'; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; font-src data: blob:; form-action 'none'; base-uri 'none'";
-            }
-            res.writeHead(200, headers);
-            fs.createReadStream(entry.absPath).pipe(res);
-            return;
-          }
-
-          res.writeHead(404);
-          res.end('Not found');
-        } catch {
-          res.writeHead(500);
-          res.end('Preview error');
-        }
-      });
-      server.once('error', reject);
-      server.listen(0, '127.0.0.1', () => {
-        const addr = server.address();
-        previewServer = server;
-        previewPort = addr.port;
-        resolve(previewPort);
-      });
-    });
-  }
-
-  function escapeHtml(text) {
-    return String(text || '')
-      .replaceAll('&', '&amp;')
-      .replaceAll('<', '&lt;')
-      .replaceAll('>', '&gt;')
-      .replaceAll('"', '&quot;');
+    return previewServerPromise;
   }
 
   async function openSandboxedPreviewWindow(electronMod, absPath) {
-    if (!electronMod?.BrowserWindow || !absPath || !fs.existsSync(absPath)) return false;
-    const port = await ensurePreviewServer();
-    const id = crypto.randomBytes(12).toString('hex');
-    if (previewItems.size > 40) {
-      const oldest = previewItems.keys().next().value;
-      previewItems.delete(oldest);
-    }
-    previewItems.set(id, { absPath, createdAt: Date.now() });
+    if (!electronMod?.BrowserWindow || !absPath) return false;
+    const ops = await getOps();
+    if (ops.isBlockedNetworkOrDevicePath(absPath) || !fs.existsSync(absPath)) return false;
+    const preview = await getPreviewServer();
+    const item = await preview.registerItem(absPath);
+    if (!item) return false;
 
     const win = new electronMod.BrowserWindow({
       width: 1020,
@@ -282,9 +147,8 @@ iframe{position:fixed;top:50px;left:0;width:100%;height:calc(100% - 50px);border
       }
     });
     win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-    win.on('closed', () => { previewItems.delete(id); });
-    const targetUrl = `http://127.0.0.1:${port}/preview?token=${encodeURIComponent(PREVIEW_TOKEN)}&id=${encodeURIComponent(id)}`;
-    await win.loadURL(targetUrl);
+    win.on('closed', () => { preview.unregisterItem(item.id); });
+    await win.loadURL(item.previewUrl);
     return true;
   }
 
