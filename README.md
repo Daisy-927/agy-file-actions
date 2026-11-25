@@ -141,3 +141,4 @@ npm test
 - 移植与适配编写：**Gemini 4 Hydrogen**。
 - 原始创意、菜单交互与前端核心代码来自 [jidekaixin2dian/dsh-file-actions](https://github.com/jidekaixin2dian/dsh-file-actions)（MIT License）。
 - 无 `app.asar` 修改的侧载 `index.cjs` 引导思路参考自 `agy-model-inspector`。
+- 社区友链与交流：[LINUX DO](https://linux.do)。
