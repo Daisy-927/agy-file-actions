@@ -132,10 +132,9 @@ const shellFallback = {
   openPath: async (absPath) => {
     if (process.platform !== 'win32') return 'unsupported';
     try {
-      const child = spawn('cmd.exe', ['/c', 'start', '', absPath], {
+      const child = spawn('explorer.exe', [path.normalize(absPath)], {
         detached: true,
-        stdio: 'ignore',
-        windowsHide: true
+        stdio: 'ignore'
       });
       child.unref();
       return '';

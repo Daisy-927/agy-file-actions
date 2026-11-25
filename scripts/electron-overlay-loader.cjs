@@ -157,13 +157,23 @@ ${overlaySrc}
   let previewServer = null;
   let previewPort = 0;
 
+  function verifyPreviewToken(provided) {
+    const token = String(provided || '');
+    if (token.length !== PREVIEW_TOKEN.length) return false;
+    try {
+      return crypto.timingSafeEqual(Buffer.from(token, 'utf8'), Buffer.from(PREVIEW_TOKEN, 'utf8'));
+    } catch {
+      return false;
+    }
+  }
+
   function ensurePreviewServer() {
     if (previewServer && previewPort) return Promise.resolve(previewPort);
     return new Promise((resolve, reject) => {
       const server = http.createServer((req, res) => {
         try {
           const url = new URL(req.url || '/', 'http://127.0.0.1');
-          if (url.searchParams.get('token') !== PREVIEW_TOKEN) {
+          if (!verifyPreviewToken(url.searchParams.get('token'))) {
             res.writeHead(403);
             res.end('Forbidden');
             return;
@@ -350,7 +360,8 @@ iframe{position:fixed;top:50px;left:0;width:100%;height:calc(100% - 50px);border
     if (fs.existsSync(SETTINGS_FILE)) lastSettingsMtime = fs.statSync(SETTINGS_FILE).mtimeMs;
   } catch {}
 
-  setInterval(async () => {
+  let settingsSyncTimer = null;
+  async function syncSettingsIfChanged() {
     try {
       if (!fs.existsSync(SETTINGS_FILE)) return;
       const mtime = fs.statSync(SETTINGS_FILE).mtimeMs;
@@ -363,7 +374,23 @@ iframe{position:fixed;top:50px;left:0;width:100%;height:calc(100% - 50px);border
         if (!wc.isDestroyed?.()) void execInMainFrame(wc, expr).catch(() => {});
       }
     } catch {}
-  }, 1500).unref();
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true });
+    const watcher = fs.watch(path.dirname(SETTINGS_FILE), (_ev, filename) => {
+      if (filename && String(filename) !== 'settings.json') return;
+      if (settingsSyncTimer) clearTimeout(settingsSyncTimer);
+      settingsSyncTimer = setTimeout(() => {
+        settingsSyncTimer = null;
+        void syncSettingsIfChanged();
+      }, 120);
+      settingsSyncTimer.unref?.();
+    });
+    watcher.unref?.();
+  } catch {
+    setInterval(() => void syncSettingsIfChanged(), 3000).unref();
+  }
 
   function hookWebContents(wc) {
     if (!wc || typeof wc !== 'object' || hookedWebContents.has(wc)) return;

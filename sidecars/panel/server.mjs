@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -5,50 +6,85 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   STATUS_FILE,
-  discoverApplications,
   launchApplication,
-  listDir,
   listRecentFiles,
   loadSettings,
-  readFileBytes,
-  resolveCandidatePaths,
   resolveConversationContext,
   revealInExplorer,
-  saveSettings,
-  statFile
+  saveSettings
 } from '../../scripts/windows-file-ops.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UI_HTML_FILE = path.join(__dirname, 'ui.html');
 const PORT = Number.parseInt(process.env.ANTIGRAVITY_SIDECAR_WEB_PORT || '18932', 10);
+const SIDECAR_TOKEN = crypto.randomBytes(24).toString('hex');
+const MAX_BODY_BYTES = 1024 * 1024;
 
 function sendJson(res, status, obj) {
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store, max-age=0',
-    'Access-Control-Allow-Origin': '*'
+    'Cache-Control': 'no-store, max-age=0'
   });
   res.end(JSON.stringify(obj));
 }
 
 function readJsonBody(req) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
+    let aborted = false;
     req.on('data', (chunk) => {
+      if (aborted) return;
       size += chunk.length;
-      if (size <= 2 * 1024 * 1024) chunks.push(chunk);
+      if (size > MAX_BODY_BYTES) {
+        aborted = true;
+        const err = new Error('Payload Too Large');
+        err.statusCode = 413;
+        reject(err);
+        req.resume();
+        return;
+      }
+      chunks.push(chunk);
     });
     req.on('end', () => {
+      if (aborted) return;
       try {
         const text = Buffer.concat(chunks).toString('utf8').trim();
         resolve(text ? JSON.parse(text) : {});
       } catch {
-        resolve({});
+        const err = new Error('Invalid JSON');
+        err.statusCode = 400;
+        reject(err);
       }
     });
-    req.on('error', () => resolve({}));
+    req.on('error', (err) => {
+      if (!aborted) reject(err);
+    });
   });
+}
+
+function isAllowedOrigin(req) {
+  const host = String(req.headers.host || '');
+  if (!/^(127\.0\.0\.1|localhost):\d+$/.test(host)) return false;
+  if (req.headers['sec-fetch-site'] === 'cross-site') return false;
+  const origin = String(req.headers.origin || '');
+  if (!origin) return true;
+  if (origin === `http://${host}`) return true;
+  const pluginOrigin = /^plugin:\/\/agy-file-actions--panel-(\d+)$/.exec(origin);
+  if (pluginOrigin && Number(pluginOrigin[1]) === Number(host.split(':').at(-1))) {
+    return true;
+  }
+  return false;
+}
+
+function hasValidToken(req) {
+  const provided = String(req.headers['x-agy-fa-token'] || '');
+  if (!provided || provided.length !== SIDECAR_TOKEN.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(provided, 'utf8'), Buffer.from(SIDECAR_TOKEN, 'utf8'));
+  } catch {
+    return false;
+  }
 }
 
 function readLoaderStatus() {
@@ -61,14 +97,21 @@ function readLoaderStatus() {
   }
 }
 
+function isInsideAnyRoot(absPath, roots) {
+  const normTarget = path.resolve(absPath).toLowerCase();
+  return (roots || []).some((root) => {
+    const normRoot = path.resolve(root).replace(/[\\/]+$/, '').toLowerCase();
+    return normTarget === normRoot || normTarget.startsWith(`${normRoot}${path.sep}`);
+  });
+}
+
 async function openFallback(absPath) {
   if (!absPath) return false;
   if (process.platform === 'win32') {
     try {
-      const child = spawn('cmd.exe', ['/c', 'start', '', absPath], {
+      const child = spawn('explorer.exe', [path.normalize(absPath)], {
         detached: true,
-        stdio: 'ignore',
-        windowsHide: true
+        stdio: 'ignore'
       });
       child.unref();
       return true;
@@ -92,68 +135,35 @@ const shellFallback = {
   }
 };
 
-async function handleRpc(body) {
-  const method = body?.method;
-  const params = body?.params || {};
-  const cid = body?.conversationId || params?.sessionId || readLoaderStatus().conversationId || '';
-  const pageUrl = body?.pageUrl || '';
-  const ctx = resolveConversationContext(cid, pageUrl);
-
-  if (method === 'getSession') {
-    return { id: ctx.id, cwd: ctx.cwd, roots: ctx.roots, outsideProject: ctx.outsideProject };
-  }
-  if (method === 'getSettings') {
-    return loadSettings();
-  }
-  if (method === 'saveSettings') {
-    return saveSettings(params);
-  }
-  if (method === 'stat') {
-    return statFile(ctx, params.path);
-  }
-  if (method === 'list') {
-    return listDir(ctx, params.path);
-  }
-  if (method === 'readBytes') {
-    return readFileBytes(ctx, params.path, params.options || {});
-  }
-  if (method === 'applications') {
-    const st = await statFile(ctx, params.path);
-    const absPath = st.ok ? st.value.absolutePath : (resolveCandidatePaths(params.path, ctx.roots)[0] || params.path);
-    return { ok: true, value: await discoverApplications(absPath) };
-  }
-  if (method === 'open') {
-    const st = await statFile(ctx, params.path);
-    const absPath = st.ok ? st.value.absolutePath : (resolveCandidatePaths(params.path, ctx.roots)[0] || params.path);
-    const ok = await launchApplication(absPath, params.appId, shellFallback);
-    return ok ? { ok: true, value: { opened: true } } : { ok: false };
-  }
-  if (method === 'reveal') {
-    const st = await statFile(ctx, params.path);
-    const absPath = st.ok ? st.value.absolutePath : (resolveCandidatePaths(params.path, ctx.roots)[0] || params.path);
-    const ok = await revealInExplorer(absPath, shellFallback);
-    return ok ? { ok: true, value: { revealed: true } } : { ok: false };
-  }
-  throw new Error(`Unsupported RPC method: ${method}`);
-}
-
 const server = http.createServer(async (req, res) => {
   try {
-    const url = new URL(req.url || '/', `http://127.0.0.1:${PORT}`);
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type'
-      });
-      res.end();
+    const host = String(req.headers.host || '');
+    if (!/^(127\.0\.0\.1|localhost):\d+$/.test(host)) {
+      sendJson(res, 403, { ok: false, error: 'Forbidden host' });
       return;
     }
 
+    const url = new URL(req.url || '/', `http://127.0.0.1:${PORT}`);
+
     if (url.pathname === '/' || url.pathname === '/index.html') {
-      const html = fs.readFileSync(UI_HTML_FILE, 'utf8');
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      // Allow top-level / iframe document navigation from Antigravity's https loopback shell,
+      // while blocking cross-site programmatic fetch() attempts on the HTML page.
+      if (req.headers['sec-fetch-site'] === 'cross-site' && req.headers['sec-fetch-mode'] === 'cors') {
+        sendJson(res, 403, { ok: false, error: 'Forbidden origin' });
+        return;
+      }
+      const rawHtml = fs.readFileSync(UI_HTML_FILE, 'utf8');
+      const html = rawHtml.replace('__AGY_FA_TOKEN__', SIDECAR_TOKEN);
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store, max-age=0'
+      });
       res.end(html);
+      return;
+    }
+
+    if (!isAllowedOrigin(req)) {
+      sendJson(res, 403, { ok: false, error: 'Forbidden origin' });
       return;
     }
 
@@ -183,6 +193,10 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       if (req.method === 'POST') {
+        if (!hasValidToken(req)) {
+          sendJson(res, 403, { ok: false, error: 'Invalid or missing token' });
+          return;
+        }
         const body = await readJsonBody(req);
         const saved = saveSettings(body);
         sendJson(res, 200, { ok: true, settings: saved });
@@ -191,10 +205,17 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === '/api/action' && req.method === 'POST') {
+      if (!hasValidToken(req)) {
+        sendJson(res, 403, { ok: false, error: 'Invalid or missing token' });
+        return;
+      }
       const body = await readJsonBody(req);
       const absPath = String(body?.path || '');
-      if (!absPath || !fs.existsSync(absPath)) {
-        sendJson(res, 404, { ok: false, error: 'File not found' });
+      const loader = readLoaderStatus();
+      const cid = loader.conversationId || process.env.ANTIGRAVITY_CONVERSATION_ID || '';
+      const ctx = resolveConversationContext(cid, loader.url || '');
+      if (!absPath || !fs.existsSync(absPath) || !isInsideAnyRoot(absPath, ctx.roots)) {
+        sendJson(res, 403, { ok: false, error: 'Path outside active session roots or not found' });
         return;
       }
       if (body.action === 'reveal') {
@@ -211,16 +232,10 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (url.pathname === '/api/rpc' && req.method === 'POST') {
-      const body = await readJsonBody(req);
-      const result = await handleRpc(body);
-      sendJson(res, 200, result);
-      return;
-    }
-
     sendJson(res, 404, { ok: false, error: 'Not found' });
   } catch (err) {
-    sendJson(res, 500, { ok: false, error: err?.message || 'Internal error' });
+    const code = Number(err?.statusCode) || 500;
+    sendJson(res, code, { ok: false, error: err?.message || 'Internal error' });
   }
 });
 

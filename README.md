@@ -15,7 +15,7 @@
 - **仅支持 Windows（Windows Only）**：目前注册表关联应用查询（`reg.exe`）、资源管理器定位（`explorer.exe` / `shell.showItemInFolder`）及安装脚本均仅针对 Windows 10/11 实现，**暂不支持 macOS 与 Linux**。
 - **Node.js**：`>= 22.0.0`（依赖内置 `node:sqlite` 与原生 `WebSocket`）。
 - **PowerShell 7 (`pwsh`)**：用于运行 [install.ps1](install.ps1)（不建议使用老旧 Windows PowerShell 5.1）。
-- **已验证宿主版本与兼容性声明**：已在 Windows 桌面端 **Google Antigravity `2.34.0` – `2.35.0`**（安装目录 `version` 标识 `44.9.1`）下实测适配；不保证兼容未来的所有 AGY 大版本——如后续官方大版本调整聊天区 DOM 结构、Sidecar 注册机制或 Electron 启动逻辑，部分识别规则或引导方式可能需要同步更新。
+- **已验证宿主版本与兼容性声明**：已在 Windows 桌面端 **Google Antigravity `2.34.0` – `2.35.1`**（安装目录 `version` 标识 `44.9.1`）下实测适配；不保证兼容未来的所有 AGY 大版本——如后续官方大版本调整聊天区 DOM 结构、Sidecar 注册机制或 Electron 启动逻辑，部分识别规则或引导方式可能需要同步更新。
 
 ---
 

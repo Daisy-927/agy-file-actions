@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="agy-fa-token" content="__AGY_FA_TOKEN__" />
   <title>文件与链接操作 · File Actions</title>
   <style>
     :root {
@@ -219,6 +220,7 @@
 
   <script>
     const $ = (id) => document.getElementById(id);
+    const apiToken = document.querySelector('meta[name="agy-fa-token"]')?.getAttribute('content') || '';
     let currentSettings = { clientSettings: { menuMode: 'full', contextLines: 8, glass: 'on' }, preferredApps: {} };
     let toastTimer = 0;
 
@@ -233,7 +235,7 @@
     async function savePatch(patch) {
       const res = await fetch('/api/settings', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-AGY-FA-Token': apiToken },
         body: JSON.stringify(patch)
       }).then((r) => r.json());
       if (res?.ok && res.settings) {
@@ -288,7 +290,7 @@
     async function doAction(action, absPath) {
       const res = await fetch('/api/action', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-AGY-FA-Token': apiToken },
         body: JSON.stringify({ action, path: absPath })
       }).then((r) => r.json());
       if (!res?.ok) showToast('操作失败');

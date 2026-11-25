@@ -410,7 +410,7 @@ ${overlaySrc}
   }
 });
 
-test('Sidecar server serves UI, /api/health, /api/status, and /api/settings', async () => {
+test('Sidecar server serves UI with CSRF token, blocks CORS/unauthenticated POSTs, removes /api/rpc, and enforces 413', async () => {
   const tmpAppData = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fa-sidecar-'));
   const sidecarPort = 28932 + Math.floor(Math.random() * 1000);
   const proc = spawn(process.execPath, ['--no-warnings', path.join(ROOT, 'sidecars', 'panel', 'server.mjs')], {
@@ -432,11 +432,47 @@ test('Sidecar server serves UI, /api/health, /api/status, and /api/settings', as
 
     const htmlRes = await fetch(`${base}/`);
     assert.equal(htmlRes.status, 200);
-    assert.match(await htmlRes.text(), /文件与链接操作/);
+    assert.equal(htmlRes.headers.get('access-control-allow-origin'), null);
+    const html = await htmlRes.text();
+    assert.match(html, /文件与链接操作/);
+    const tokenMatch = /name="agy-fa-token" content="([0-9a-f]+)"/.exec(html);
+    assert.ok(tokenMatch, 'Expected embedded CSRF token in ui.html');
+    const token = tokenMatch[1];
 
-    const saved = await (await fetch(`${base}/api/settings`, {
+    // /api/rpc must be completely removed
+    const rpcRes = await fetch(`${base}/api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-AGY-FA-Token': token },
+      body: JSON.stringify({ method: 'getSettings' })
+    });
+    assert.equal(rpcRes.status, 404);
+
+    // Cross-site / foreign Origin must be rejected
+    const crossSiteRes = await fetch(`${base}/api/status`, {
+      headers: { Origin: 'https://evil.example', 'Sec-Fetch-Site': 'cross-site' }
+    });
+    assert.equal(crossSiteRes.status, 403);
+
+    // POST without token must be rejected
+    const noTokenRes = await fetch(`${base}/api/settings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clientSettings: { menuMode: 'compact' } })
+    });
+    assert.equal(noTokenRes.status, 403);
+
+    // Oversized body (> 1 MiB) must return 413 Payload Too Large
+    const tooLargeRes = await fetch(`${base}/api/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-AGY-FA-Token': token },
+      body: JSON.stringify({ pad: 'a'.repeat(1024 * 1024 + 64) })
+    });
+    assert.equal(tooLargeRes.status, 413);
+
+    // Valid token succeeds
+    const saved = await (await fetch(`${base}/api/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-AGY-FA-Token': token },
       body: JSON.stringify({ clientSettings: { menuMode: 'compact', contextLines: 16 } })
     })).json();
     assert.equal(saved.ok, true);
