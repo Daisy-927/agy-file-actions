@@ -13,10 +13,11 @@
   'use strict';
 
   const VERSION = 'agy-file-actions-v1';
-  const BUILD = '20261122-1';
+  const BUILD = '20261126-3';
   const SETTINGS_KEY = 'dsh-file-actions.settings.v1';
   const PREF_APPS_KEY = 'dsh-file-actions.preferred-apps.v1';
   const APPS_CACHE_KEY = 'dsh-file-actions.apps.v1';
+  const DROP_MODE_KEY = 'agy-file-actions.drop-mode.v1';
   const CLIENT_ID = '@jidekaixin2dian/dsh-file-actions';
 
   const prev = globalThis.__AGY_FILE_ACTIONS_OVERLAY__;
@@ -204,6 +205,18 @@
   let lastSyncedSettingsJson = '';
   let lastSyncedPrefsJson = '';
 
+  function normalizeDropPathMode(val) {
+    return val === 'always' || val === 'off' ? val : 'default';
+  }
+
+  let currentDropPathMode = (() => {
+    try {
+      return normalizeDropPathMode(window.localStorage.getItem(DROP_MODE_KEY));
+    } catch {
+      return 'default';
+    }
+  })();
+
   function readLocalJson(key) {
     try {
       const raw = window.localStorage.getItem(key);
@@ -216,19 +229,23 @@
   function applySettingsToLocalStorage(data, emitEvent = false) {
     if (!data || typeof data !== 'object') return;
     try {
+      if (data.dropPathMode !== undefined) {
+        currentDropPathMode = normalizeDropPathMode(data.dropPathMode);
+        window.localStorage.setItem(DROP_MODE_KEY, currentDropPathMode);
+      }
       if (data.clientSettings) {
         const nextStr = JSON.stringify(data.clientSettings);
+        lastSyncedSettingsJson = nextStr;
         if (window.localStorage.getItem(SETTINGS_KEY) !== nextStr) {
           window.localStorage.setItem(SETTINGS_KEY, nextStr);
-          lastSyncedSettingsJson = nextStr;
           if (emitEvent) window.dispatchEvent(new StorageEvent('storage', { key: SETTINGS_KEY }));
         }
       }
       if (data.preferredApps) {
         const nextPrefStr = JSON.stringify(data.preferredApps);
+        lastSyncedPrefsJson = nextPrefStr;
         if (window.localStorage.getItem(PREF_APPS_KEY) !== nextPrefStr) {
           window.localStorage.setItem(PREF_APPS_KEY, nextPrefStr);
-          lastSyncedPrefsJson = nextPrefStr;
           if (emitEvent) window.dispatchEvent(new StorageEvent('storage', { key: PREF_APPS_KEY }));
         }
       }
@@ -473,6 +490,381 @@
     originalWindowOpen = null;
   }
 
+  /* ─────────────────────── Drag-Drop Local Path Bridge ─────────────────────── */
+
+  const DROP_WEB_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg']);
+  const DROP_WEB_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/svg+xml', 'image/webp']);
+  const DROP_CODE_TEXT_EXTS = new Set([
+    'txt', 'csv', 'tsv', 'log', 'ini', 'cfg', 'conf', 'env', 'toml',
+    'json', 'jsonc', 'jsonl', 'ndjson', 'md', 'markdown', 'mdx', 'html', 'htm',
+    'css', 'scss', 'less', 'js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'mts', 'cts',
+    'py', 'xml', 'go', 'rs', 'java', 'kt', 'kts', 'cs', 'c', 'cc', 'cpp', 'cxx',
+    'h', 'hh', 'hpp', 'swift', 'rb', 'php', 'sh', 'bash', 'zsh', 'ps1', 'bat', 'cmd',
+    'sql', 'yaml', 'yml', 'proto', 'graphql', 'gql', 'vue', 'svelte', 'astro',
+    'lua', 'r', 'dart', 'scala', 'gradle'
+  ]);
+  const DROP_DOC_EXTS = new Set(['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx']);
+  const DROP_DOC_MIMES = new Set([
+    'application/pdf',
+    'application/msword',
+    'application/vnd.ms-excel',
+    'application/vnd.ms-powerpoint',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+  ]);
+  const DROP_MEDIA_EXTS = new Set([
+    'mp4', 'webm', 'wav', 'mp3', 'm4a', 'aac', 'ogg', 'flac', 'opus', 'weba', 'zip'
+  ]);
+  const DROP_MEDIA_MIMES = new Set([
+    'video/mp4', 'video/webm',
+    'audio/wav', 'audio/wave', 'audio/x-wav', 'audio/vnd.wave',
+    'audio/mp3', 'audio/mpeg', 'audio/m4a', 'audio/mp4', 'audio/aac',
+    'audio/ogg', 'audio/flac', 'audio/opus', 'audio/l16', 'audio/webm',
+    'application/zip', 'application/x-zip-compressed', 'application/x-zip'
+  ]);
+
+  const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+  const MAX_TEXT_BYTES = 1 * 1024 * 1024;
+  const MAX_DOC_BYTES = 10 * 1024 * 1024;
+  const MAX_MEDIA_BYTES = 20 * 1024 * 1024;
+  const MAX_ATTACH_COUNT = 5;
+
+  const DROP_DOT_TEXT_NAMES = new Set([
+    '.env', '.gitignore', '.gitattributes', '.gitmodules', '.npmrc', '.yarnrc',
+    '.editorconfig', '.dockerignore', '.nvmrc', '.browserslistrc', '.prettierrc', '.eslintrc', '.htaccess'
+  ]);
+
+  function getFileExtension(fileName) {
+    const lower = String(fileName || '').trim().toLowerCase();
+    if (!lower || lower.endsWith('.tar.gz')) return '';
+    if (DROP_DOT_TEXT_NAMES.has(lower)) return 'txt';
+    const dot = lower.lastIndexOf('.');
+    return dot > 0 ? lower.slice(dot + 1) : '';
+  }
+
+  function isNativeWebImage(file) {
+    const ext = getFileExtension(file?.name);
+    if (DROP_WEB_IMAGE_EXTS.has(ext)) return true;
+    const mime = String(file?.type || '').split(';')[0].trim().toLowerCase();
+    return DROP_WEB_IMAGE_MIMES.has(mime);
+  }
+
+  function classifyNativeCategory(file) {
+    if (isNativeWebImage(file)) return 'image';
+    const ext = getFileExtension(file?.name);
+    const mime = String(file?.type || '').split(';')[0].trim().toLowerCase();
+    if (DROP_CODE_TEXT_EXTS.has(ext) || mime.startsWith('text/')) return 'code';
+    if (DROP_DOC_EXTS.has(ext) || DROP_DOC_MIMES.has(mime)) return 'doc';
+    if (DROP_MEDIA_EXTS.has(ext) || DROP_MEDIA_MIMES.has(mime) || mime.startsWith('audio/')) return 'media';
+    return 'other';
+  }
+
+  function getLocalPathForDroppedFile(file) {
+    try {
+      if (typeof window.electronNative?.getPathForFile === 'function') {
+        const resolved = window.electronNative.getPathForFile(file);
+        if (typeof resolved === 'string' && resolved.trim()) return resolved.trim();
+      }
+      if (typeof file?.path === 'string' && file.path.trim()) return file.path.trim();
+    } catch {}
+    return '';
+  }
+
+  function classifyDroppedFiles(entries, mode = currentDropPathMode) {
+    const activeMode = normalizeDropPathMode(mode);
+    const items = [];
+    let nativeAttachCount = 0;
+    let nativeAttachBytes = 0;
+    let nativeCodeCount = 0;
+    let usePathCount = 0;
+
+    for (const entry of entries || []) {
+      const file = entry?.file;
+      const absPath = String(entry?.absPath || '').trim();
+      const isDir = Boolean(entry?.isDir);
+      const size = Math.max(0, Number(file?.size || 0));
+
+      if (activeMode === 'off' || !absPath) {
+        items.push({ file, absPath, isDir, usePath: false, nativeKind: 'ignore' });
+        continue;
+      }
+
+      const category = classifyNativeCategory(file);
+      let usePath = false;
+      let nativeKind = 'path';
+
+      if (activeMode === 'always') {
+        const fitsSmallImage = !isDir
+          && category === 'image'
+          && size <= MAX_IMAGE_BYTES
+          && nativeAttachCount < MAX_ATTACH_COUNT
+          && nativeAttachBytes + size <= MAX_MEDIA_BYTES;
+        if (fitsSmallImage) {
+          nativeKind = 'media';
+          nativeAttachCount += 1;
+          nativeAttachBytes += size;
+        } else {
+          usePath = true;
+        }
+      } else if (isDir) {
+        nativeKind = 'code';
+        nativeCodeCount += 1;
+      } else if (category === 'code') {
+        if (size <= MAX_TEXT_BYTES) {
+          nativeKind = 'code';
+          nativeCodeCount += 1;
+        } else {
+          usePath = true;
+        }
+      } else if (category === 'image' || category === 'doc' || category === 'media') {
+        const perFileLimit = category === 'media' ? MAX_MEDIA_BYTES : MAX_IMAGE_BYTES;
+        const limit = category === 'doc' ? MAX_DOC_BYTES : perFileLimit;
+        if (size <= limit && nativeAttachCount < MAX_ATTACH_COUNT && nativeAttachBytes + size <= MAX_MEDIA_BYTES) {
+          nativeKind = 'media';
+          nativeAttachCount += 1;
+          nativeAttachBytes += size;
+        } else {
+          usePath = true;
+        }
+      } else {
+        usePath = true;
+      }
+
+      if (usePath) usePathCount += 1;
+      items.push({ file, absPath, isDir, usePath, nativeKind });
+    }
+
+    // Synthetic DataTransfer clones lose Electron's webUtils.getPathForFile identity;
+    // when code files are mixed with fallback files, convert them to paths too so none are lost.
+    if (usePathCount > 0 && nativeCodeCount > 0) {
+      for (const item of items) {
+        if (!item.usePath && item.nativeKind === 'code' && item.absPath) {
+          item.usePath = true;
+          item.nativeKind = 'path';
+          usePathCount += 1;
+        }
+      }
+    }
+
+    return {
+      items,
+      usePathCount,
+      nativeMediaItems: items.filter((it) => !it.usePath && it.nativeKind === 'media' && it.file)
+    };
+  }
+
+  function formatDroppedPath(rawPath) {
+    const p = String(rawPath || '').trim();
+    if (!p) return '';
+    return /[\s"]/.test(p) ? `"${p.replace(/"/g, '\\"')}"` : p;
+  }
+
+  function formatDroppedPaths(paths) {
+    return (paths || []).map(formatDroppedPath).filter(Boolean).join('\n');
+  }
+
+  function findDropComposerTarget(eventTarget) {
+    const el = eventTarget instanceof Element
+      ? eventTarget
+      : eventTarget instanceof Node
+        ? eventTarget.parentElement
+        : null;
+    if (!el) return null;
+    if (el.closest?.('input[type="file"], webview, [data-testid="builtin-browser-webview-pool"]')) {
+      return null;
+    }
+    const scope = el.closest('[data-media-drop-scope]') || el.closest('[data-lexical-editor="true"]');
+    if (!scope) return null;
+    const editor = el.closest('[data-lexical-editor="true"], textarea, [contenteditable="true"]')
+      || scope.querySelector('[data-lexical-editor="true"]')
+      || scope.querySelector('textarea, [contenteditable="true"]');
+    return editor ? { scope, editor } : null;
+  }
+
+  function placeCursorAtEnd(editorEl) {
+    try {
+      const sel = window.getSelection();
+      if (!sel) return;
+      if (sel.rangeCount > 0 && editorEl.contains(sel.anchorNode)) return;
+      const range = document.createRange();
+      range.selectNodeContents(editorEl);
+      range.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+    } catch {}
+  }
+
+  function getTextBeforeCursor(editorEl) {
+    try {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0) {
+        return editorEl.textContent || '';
+      }
+      const selRange = sel.getRangeAt(0);
+      if (!editorEl.contains(selRange.startContainer)) {
+        return editorEl.textContent || '';
+      }
+      const range = document.createRange();
+      range.selectNodeContents(editorEl);
+      range.setEnd(selRange.startContainer, selRange.startOffset);
+      return range.toString();
+    } catch {
+      return editorEl.textContent || '';
+    }
+  }
+
+  function insertPathsIntoComposer(editorEl, paths) {
+    const body = formatDroppedPaths(paths);
+    if (!editorEl || !body) return false;
+
+    if (editorEl instanceof HTMLTextAreaElement || editorEl instanceof HTMLInputElement) {
+      editorEl.focus({ preventScroll: true });
+      const start = typeof editorEl.selectionStart === 'number' ? editorEl.selectionStart : editorEl.value.length;
+      const end = typeof editorEl.selectionEnd === 'number' ? editorEl.selectionEnd : start;
+      const prefix = start > 0 && !/\s$/.test(editorEl.value.slice(0, start)) ? '\n' : '';
+      editorEl.setRangeText(`${prefix}${body}`, start, end, 'end');
+      editorEl.dispatchEvent(new Event('input', { bubbles: true }));
+      return true;
+    }
+
+    editorEl.focus({ preventScroll: true });
+    placeCursorAtEnd(editorEl);
+
+    const beforeDomText = editorEl.textContent || '';
+    const beforeCursor = getTextBeforeCursor(editorEl);
+    const prefix = beforeCursor.length > 0 && !/\s$/.test(beforeCursor) ? '\n' : '';
+    const payload = `${prefix}${body}`;
+
+    try {
+      const dt = new DataTransfer();
+      dt.setData('text/plain', payload);
+      const pasteEv = new ClipboardEvent('paste', {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: dt
+      });
+      editorEl.dispatchEvent(pasteEv);
+      // Lexical PASTE_COMMAND calls preventDefault() and commits in an async update(),
+      // so rely on defaultPrevented as well as synchronous DOM delta to avoid double insertion.
+      if (pasteEv.defaultPrevented || (editorEl.textContent || '') !== beforeDomText) {
+        return true;
+      }
+    } catch {}
+
+    try {
+      if (document.execCommand?.('insertText', false, payload)) {
+        return true;
+      }
+    } catch {}
+
+    try {
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount > 0) {
+        const range = sel.getRangeAt(0);
+        range.deleteContents();
+        const node = document.createTextNode(payload);
+        range.insertNode(node);
+        range.setStartAfter(node);
+        range.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      } else {
+        editorEl.appendChild(document.createTextNode(payload));
+      }
+      editorEl.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: payload }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  let dropBridgeCleanup = null;
+
+  function installDropPathBridge() {
+    if (dropBridgeCleanup) return;
+    const syntheticDropEvents = new WeakSet();
+
+    const canBridgeCurrentEnv = () => (
+      currentDropPathMode !== 'off'
+      && (
+        typeof window.electronNative?.getPathForFile === 'function'
+        || (typeof File !== 'undefined' && 'path' in File.prototype)
+        || globalThis.__AGY_FA_TEST_ALLOW_DROP_PATH__ === true
+      )
+    );
+
+    const onDragOverBubble = (ev) => {
+      if (!canBridgeCurrentEnv()) return;
+      const types = ev.dataTransfer?.types;
+      if (!types || !Array.from(types).includes('Files')) return;
+      if (!findDropComposerTarget(ev.target)) return;
+      ev.preventDefault();
+      if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
+    };
+
+    const onDropCapture = (ev) => {
+      if (syntheticDropEvents.has(ev) || !canBridgeCurrentEnv()) return;
+      const dt = ev.dataTransfer;
+      if (!dt || !dt.files || dt.files.length === 0) return;
+      if (Array.from(dt.types || []).includes('application/context-scope-item-cider')) return;
+
+      const hit = findDropComposerTarget(ev.target);
+      if (!hit) return;
+
+      const fileItems = Array.from(dt.items || []).filter((it) => it.kind === 'file');
+      const entries = Array.from(dt.files).map((file, idx) => ({
+        file,
+        absPath: getLocalPathForDroppedFile(file),
+        isDir: Boolean(fileItems[idx]?.webkitGetAsEntry?.()?.isDirectory)
+      }));
+
+      const plan = classifyDroppedFiles(entries, currentDropPathMode);
+      if (plan.usePathCount === 0) return;
+
+      ev.preventDefault();
+      ev.stopPropagation();
+      ev.stopImmediatePropagation();
+
+      const dropTarget = ev.target;
+      const pathStrings = plan.items.filter((it) => it.usePath && it.absPath).map((it) => it.absPath);
+
+      if (plan.nativeMediaItems.length > 0 && dropTarget) {
+        try {
+          const filteredDt = new DataTransfer();
+          for (const item of plan.nativeMediaItems) {
+            filteredDt.items.add(item.file);
+          }
+          const relayEv = new DragEvent('drop', {
+            bubbles: true,
+            cancelable: true,
+            clientX: ev.clientX,
+            clientY: ev.clientY,
+            dataTransfer: filteredDt
+          });
+          syntheticDropEvents.add(relayEv);
+          dropTarget.dispatchEvent(relayEv);
+        } catch {}
+      } else {
+        try {
+          window.dispatchEvent(new Event('dragend'));
+        } catch {}
+      }
+
+      if (pathStrings.length > 0) {
+        insertPathsIntoComposer(hit.editor, pathStrings);
+      }
+    };
+
+    document.addEventListener('dragover', onDragOverBubble, false);
+    window.addEventListener('drop', onDropCapture, true);
+    dropBridgeCleanup = () => {
+      document.removeEventListener('dragover', onDragOverBubble, false);
+      window.removeEventListener('drop', onDropCapture, true);
+    };
+  }
+
   /* ─────────────────────── Bootstrap & Mount ─────────────────────── */
 
   let cleanupPlugin = null;
@@ -501,6 +893,7 @@
     syncThemeFloor();
     installBridgeInterface();
     installWindowOpenHook();
+    installDropPathBridge();
 
     const plugin = factory(() => {
       throw new Error('require unavailable in overlay');
@@ -648,6 +1041,8 @@
     cleanupPlugin = null;
     try { preCaptureCleanup?.(); } catch {}
     preCaptureCleanup = null;
+    try { dropBridgeCleanup?.(); } catch {}
+    dropBridgeCleanup = null;
     uninstallWindowOpenHook();
     flushWaiterOnUnload();
   }
@@ -658,6 +1053,13 @@
     void refreshSessionSnapshot();
   }
 
-  globalThis.__AGY_FILE_ACTIONS_OVERLAY__ = { version: VERSION, build: BUILD, refresh, stop };
+  globalThis.__AGY_FILE_ACTIONS_OVERLAY__ = {
+    version: VERSION,
+    build: BUILD,
+    refresh,
+    stop,
+    classifyDroppedFiles,
+    formatDroppedPaths
+  };
   startOverlay();
 })();

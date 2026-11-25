@@ -15,6 +15,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import {
+  SETTINGS_FILE,
   discoverApplications,
   isBlockedNetworkOrDevicePath,
   launchApplication,
@@ -143,16 +144,14 @@ const shellFallback = {
     } catch (err) {
       return err?.message || 'failed';
     }
-  },
-  showItemInFolder: (absPath) => {
-    if (process.platform !== 'win32') return;
-    const child = spawn('explorer.exe', [`/select,${path.normalize(absPath)}`], {
-      detached: true,
-      stdio: 'ignore'
-    });
-    child.unref();
   }
 };
+
+function resolveExistingCandidate(rawPath, roots) {
+  const candidates = resolveCandidatePaths(rawPath, roots);
+  if (!candidates.length) return '';
+  return candidates.find((c) => fs.existsSync(c)) || candidates[0] || '';
+}
 
 function openPreviewUrlInBrowser(previewUrl) {
   if (!/^https?:\/\/127\.0\.0\.1:\d+\//i.test(String(previewUrl || ''))) return false;
@@ -185,18 +184,20 @@ export async function handleRpc(req, targetUrl = '', options = {}) {
   if (method === 'readBytes') return readFileBytes(ctx, params.path, params.options || {});
   if (method === 'applications') {
     const st = await statFile(ctx, params.path);
-    const absPath = st.ok ? st.value.absolutePath : (resolveCandidatePaths(params.path, ctx.roots)[0] || params.path);
+    const absPath = st.ok ? st.value.absolutePath : resolveExistingCandidate(params.path, ctx.roots);
+    if (!absPath) return { ok: true, value: [] };
     return { ok: true, value: await discoverApplications(absPath) };
   }
   if (method === 'open') {
     const st = await statFile(ctx, params.path);
-    const absPath = st.ok ? st.value.absolutePath : (resolveCandidatePaths(params.path, ctx.roots)[0] || params.path);
+    const absPath = st.ok ? st.value.absolutePath : resolveExistingCandidate(params.path, ctx.roots);
+    if (!absPath) return { ok: false, error: { code: 'invalid-path' } };
     const ok = await launchApplication(absPath, params.appId, shellApi);
     return ok ? { ok: true, value: { opened: true } } : { ok: false };
   }
   if (method === 'previewInBrowser') {
     const st = await statFile(ctx, params.path);
-    const absPath = st.ok ? st.value.absolutePath : (resolveCandidatePaths(params.path, ctx.roots)[0] || '');
+    const absPath = st.ok ? st.value.absolutePath : resolveExistingCandidate(params.path, ctx.roots);
     if (!absPath || isBlockedNetworkOrDevicePath(absPath) || !fs.existsSync(absPath)) {
       return { ok: false };
     }
@@ -207,7 +208,8 @@ export async function handleRpc(req, targetUrl = '', options = {}) {
   }
   if (method === 'reveal') {
     const st = await statFile(ctx, params.path);
-    const absPath = st.ok ? st.value.absolutePath : (resolveCandidatePaths(params.path, ctx.roots)[0] || params.path);
+    const absPath = st.ok ? st.value.absolutePath : resolveExistingCandidate(params.path, ctx.roots);
+    if (!absPath) return { ok: false, error: { code: 'invalid-path' } };
     const ok = await revealInExplorer(absPath, shellApi);
     return ok ? { ok: true, value: { revealed: true } } : { ok: false };
   }
@@ -218,13 +220,37 @@ export async function closePreviewServer() {
   await previewServer.close();
 }
 
+const LIVE_SESSIONS = new Set();
+
+function startSettingsWatcher() {
+  const settingsDir = path.dirname(SETTINGS_FILE);
+  try {
+    fs.mkdirSync(settingsDir, { recursive: true });
+    let timer = null;
+    const watcher = fs.watch(settingsDir, (_event, filename) => {
+      if (filename && String(filename).toLowerCase() !== 'settings.json') return;
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        const latest = loadSettings();
+        const expr = `globalThis.__AGY_FA_BRIDGE__?.applyHostSettings(${JSON.stringify(latest)})`;
+        for (const cdp of LIVE_SESSIONS) {
+          void cdp.call('Runtime.evaluate', { expression: expr }).catch(() => {});
+        }
+      }, 150);
+    });
+    watcher.unref?.();
+  } catch {}
+}
+
 async function attachTarget(target) {
   const cdp = await cdpSession(target.webSocketDebuggerUrl);
+  LIVE_SESSIONS.add(cdp);
   await cdp.call('Runtime.enable');
   await cdp.call('Runtime.evaluate', { expression: getBundle() });
   console.log(`[agy-file-actions] CDP attached: ${target.id} ${target.url}`);
 
   if (ONCE) {
+    LIVE_SESSIONS.delete(cdp);
     cdp.close();
     return;
   }
@@ -259,6 +285,7 @@ async function attachTarget(target) {
       );
     }
   } finally {
+    LIVE_SESSIONS.delete(cdp);
     ATTACHED.delete(target.id);
     cdp.close();
   }
@@ -296,6 +323,7 @@ async function main() {
     await scanOnce();
     return;
   }
+  startSettingsWatcher();
   console.log(`[agy-file-actions] CDP runtime injector polling every ${POLL_MS}ms`);
   while (true) {
     try { await scanOnce(); } catch {}

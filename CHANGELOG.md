@@ -2,6 +2,18 @@
 
 All notable changes to `agy-file-actions` are documented in this file.
 
+## [0.1.3] - 2026-11-26
+
+### Added
+- **Drag-and-drop local path bridge (`scripts/agy-file-actions-overlay.js`)**: Automatically bypasses Antigravity's native upload size/format rejection errors for oversized files (>10 MB images/PDF/Office, >20 MB audio/video/ZIP, >1 MB text/logs) and unsupported binary/archive types (`.7z`, `.rar`, `.exe`, `.iso`, etc.) by resolving local paths via Electron `window.electronNative.getPathForFile` and inserting one path per line (auto-quoted on spaces) directly into the Lexical chat composer.
+- **Mixed drop handling**: Preserves native attachment handling for small images (`<= 10 MB`), code files (`<= 1 MB`), and within-quota documents/media while seamlessly extracting paths for any oversized/unsupported files dropped alongside them.
+- **Sidecar configuration (`sidecars/panel/ui.html`, `scripts/windows-file-ops.mjs`)**: Added the `拖入文件转路径` setting with three modes (`默认`, `纯路径`, `关闭`) and full descriptions in the Sidecar panel.
+
+### Fixed
+- Aligned `dataTransfer.items` (`kind === 'file'`) with `dataTransfer.files`, supported config dotfiles (`.env`, `.gitignore`, etc.), calculated cursor-relative newline prefixes and dispatched `selectionchange` before pasting into Lexical, and fixed `lastSyncedSettingsJson` baseline updates (`scripts/agy-file-actions-overlay.js`).
+- Re-attached SPA tabs returning to a conversation route after navigating away (`scripts/electron-overlay-loader.cjs`), and added hot `settings.json` sync + `ms-msdt:`/non-file URI blocking without raw `params.path` passthrough (`scripts/electron-overlay-loader.cjs`, `scripts/runtime-injector.mjs`, `scripts/windows-file-ops.mjs`).
+- Preserved existing `glass` setting on partial updates, escaped literal `$` sequences in `buildSpawnArgs`, handled commas cleanly in `explorer.exe /select,` fallback (`scripts/windows-file-ops.mjs`, `sidecars/panel/server.mjs`), and added rollback/error feedback in `sidecars/panel/ui.html`.
+
 ## [0.1.2] - 2026-11-25
 
 ### Fixed

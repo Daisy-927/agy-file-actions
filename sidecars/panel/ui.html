@@ -109,6 +109,7 @@
       padding: 5px 10px;
       cursor: pointer;
     }
+    select { flex: none; }
     button:hover { border-color: var(--accent); }
     button.ghost {
       background: transparent;
@@ -195,6 +196,21 @@
         <option value="16">前后各 16 行</option>
       </select>
     </div>
+    <div class="row" style="align-items: flex-start;">
+      <div>
+        <div class="row-label">拖入文件转路径</div>
+        <div class="row-help">
+          <b>默认</b>：仅超限大文件及原生不支持的格式（如 .7z / .rar / .exe / .iso 等）自动插绝对路径，小图、代码与额度内文档/音视频保留 AGY 原生附件；多文件每行一个。<br />
+          <b>纯路径</b>：除小图（≤ 10 MB）保留附件外，其余文件一律直接插本机绝对路径。<br />
+          <b>关闭</b>：完全还原 AGY 原生拖放逻辑。
+        </div>
+      </div>
+      <select id="sel-drop-path-mode">
+        <option value="default">默认</option>
+        <option value="always">纯路径</option>
+        <option value="off">关闭</option>
+      </select>
+    </div>
   </div>
 
   <div class="card">
@@ -221,7 +237,11 @@
   <script>
     const $ = (id) => document.getElementById(id);
     const apiToken = document.querySelector('meta[name="agy-fa-token"]')?.getAttribute('content') || '';
-    let currentSettings = { clientSettings: { menuMode: 'full', contextLines: 8, glass: 'on' }, preferredApps: {} };
+    let currentSettings = {
+      clientSettings: { menuMode: 'full', contextLines: 8, glass: 'on' },
+      preferredApps: {},
+      dropPathMode: 'default'
+    };
     let toastTimer = 0;
 
     function showToast(msg) {
@@ -233,15 +253,30 @@
     }
 
     async function savePatch(patch) {
-      const res = await fetch('/api/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-AGY-FA-Token': apiToken },
-        body: JSON.stringify(patch)
-      }).then((r) => r.json());
-      if (res?.ok && res.settings) {
-        currentSettings = res.settings;
+      try {
+        const resp = await fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-AGY-FA-Token': apiToken },
+          body: JSON.stringify(patch)
+        });
+        const res = await resp.json().catch(() => null);
+        if (resp.status === 403) {
+          renderSettings();
+          showToast('会话令牌已更新，正在刷新面板…');
+          setTimeout(() => location.reload(), 700);
+          return;
+        }
+        if (resp.ok && res?.ok && res.settings) {
+          currentSettings = res.settings;
+          renderSettings();
+          showToast('设置已保存并同步');
+          return;
+        }
         renderSettings();
-        showToast('设置已保存并同步');
+        showToast(res?.error ? `保存失败：${res.error}` : '设置保存失败，已恢复原选项');
+      } catch {
+        renderSettings();
+        showToast('连接 Sidecar 失败，设置未保存');
       }
     }
 
@@ -249,6 +284,9 @@
       const cs = currentSettings.clientSettings || {};
       $('sel-menu-mode').value = cs.menuMode === 'compact' ? 'compact' : 'full';
       $('sel-context-lines').value = String([4, 8, 16].includes(Number(cs.contextLines)) ? cs.contextLines : 8);
+      $('sel-drop-path-mode').value = ['default', 'always', 'off'].includes(currentSettings.dropPathMode)
+        ? currentSettings.dropPathMode
+        : 'default';
 
       const prefs = currentSettings.preferredApps || {};
       const entries = Object.entries(prefs).filter(([k, v]) => k && v);
@@ -298,11 +336,19 @@
 
     async function loadStatus() {
       try {
-        const data = await fetch('/api/status', {
+        const resp = await fetch('/api/status', {
           cache: 'no-store',
           headers: { 'X-AGY-FA-Token': apiToken }
-        }).then((r) => r.json());
-        if (!data?.ok) return;
+        });
+        const data = await resp.json().catch(() => null);
+        if (resp.status === 403) {
+          $('status-text').textContent = '鉴权失效，请刷新面板';
+          return;
+        }
+        if (!resp.ok || !data?.ok) {
+          $('status-text').textContent = '状态获取失败';
+          return;
+        }
         const active = Boolean(data.loader?.active);
         $('status-dot').classList.toggle('ok', active);
         $('status-text').textContent = active ? '注入已激活' : '未注入（需运行 install.ps1）';
@@ -375,8 +421,11 @@
     $('sel-context-lines').addEventListener('change', (e) => {
       void savePatch({ clientSettings: { ...currentSettings.clientSettings, contextLines: Number(e.target.value) } });
     });
+    $('sel-drop-path-mode').addEventListener('change', (e) => {
+      void savePatch({ dropPathMode: e.target.value });
+    });
     $('btn-reset').addEventListener('click', () => {
-      void savePatch({ clientSettings: { menuMode: 'full', contextLines: 8, glass: 'on' } });
+      void savePatch({ clientSettings: { menuMode: 'full', contextLines: 8, glass: 'on' }, dropPathMode: 'default' });
     });
     $('btn-clear-prefs').addEventListener('click', () => {
       void savePatch({ preferredApps: {} });

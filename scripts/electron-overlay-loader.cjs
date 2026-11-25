@@ -156,6 +156,12 @@ ${overlaySrc}
 
   let electronRef = null;
 
+  function resolveExistingCandidate(ops, rawPath, roots) {
+    const candidates = ops.resolveCandidatePaths(rawPath, roots);
+    if (!candidates.length) return '';
+    return candidates.find((c) => fs.existsSync(c)) || candidates[0] || '';
+  }
+
   async function handleRpcRequest(req) {
     const ops = await getOps();
     const method = req?.method;
@@ -184,7 +190,8 @@ ${overlaySrc}
     }
     if (method === 'applications') {
       const statRes = await ops.statFile(ctx, params.path);
-      const absPath = statRes.ok ? statRes.value.absolutePath : (ops.resolveCandidatePaths(params.path, ctx.roots)[0] || params.path);
+      const absPath = statRes.ok ? statRes.value.absolutePath : resolveExistingCandidate(ops, params.path, ctx.roots);
+      if (!absPath) return { ok: true, value: [] };
       const apps = await ops.discoverApplications(absPath, {
         getFileIcon: electronRef?.app?.getFileIcon
           ? (exePath) => electronRef.app.getFileIcon(exePath, { size: 'small' })
@@ -194,19 +201,22 @@ ${overlaySrc}
     }
     if (method === 'open') {
       const statRes = await ops.statFile(ctx, params.path);
-      const absPath = statRes.ok ? statRes.value.absolutePath : (ops.resolveCandidatePaths(params.path, ctx.roots)[0] || params.path);
+      const absPath = statRes.ok ? statRes.value.absolutePath : resolveExistingCandidate(ops, params.path, ctx.roots);
+      if (!absPath) return { ok: false, error: { code: 'invalid-path' } };
       const ok = await ops.launchApplication(absPath, params.appId, electronRef?.shell);
       return ok ? { ok: true, value: { opened: true } } : { ok: false, error: { code: 'open-failed' } };
     }
     if (method === 'reveal') {
       const statRes = await ops.statFile(ctx, params.path);
-      const absPath = statRes.ok ? statRes.value.absolutePath : (ops.resolveCandidatePaths(params.path, ctx.roots)[0] || params.path);
+      const absPath = statRes.ok ? statRes.value.absolutePath : resolveExistingCandidate(ops, params.path, ctx.roots);
+      if (!absPath) return { ok: false, error: { code: 'invalid-path' } };
       const ok = await ops.revealInExplorer(absPath, electronRef?.shell);
       return ok ? { ok: true, value: { revealed: true } } : { ok: false, error: { code: 'reveal-failed' } };
     }
     if (method === 'previewInBrowser') {
       const statRes = await ops.statFile(ctx, params.path);
-      const absPath = statRes.ok ? statRes.value.absolutePath : (ops.resolveCandidatePaths(params.path, ctx.roots)[0] || params.path);
+      const absPath = statRes.ok ? statRes.value.absolutePath : resolveExistingCandidate(ops, params.path, ctx.roots);
+      if (!absPath) return { ok: false };
       const ok = await openSandboxedPreviewWindow(electronRef, absPath);
       return { ok };
     }
@@ -289,9 +299,9 @@ ${overlaySrc}
         await execInMainFrame(wc, bundle.source);
         state.injectedVersionKey = versionKey;
         state.lastUrl = url;
-        activeAttached.add(wc);
         writeStatus({ stage: 'attached', url, conversationId: cid });
       }
+      activeAttached.add(wc);
       return true;
     }
 
@@ -347,6 +357,7 @@ ${overlaySrc}
         }
         void runRpcPump();
       } else {
+        state.lastUrl = url;
         activeAttached.delete(wc);
       }
     }

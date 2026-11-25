@@ -137,16 +137,7 @@ async function openFallback(absPath) {
 }
 
 const shellFallback = {
-  openPath: async (absPath) => ((await openFallback(absPath)) ? '' : 'failed'),
-  showItemInFolder: (absPath) => {
-    if (process.platform === 'win32') {
-      const child = spawn('explorer.exe', [`/select,${path.normalize(absPath)}`], {
-        detached: true,
-        stdio: 'ignore'
-      });
-      child.unref();
-    }
-  }
+  openPath: async (absPath) => ((await openFallback(absPath)) ? '' : 'failed')
 };
 
 const server = http.createServer(async (req, res) => {

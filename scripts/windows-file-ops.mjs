@@ -70,10 +70,15 @@ export function ensurePluginDataDir() {
   } catch {}
 }
 
+function normalizeDropPathMode(val) {
+  return val === 'always' || val === 'off' ? val : 'default';
+}
+
 export function loadSettings() {
   const defaults = {
     clientSettings: { menuMode: 'full', contextLines: 8, glass: 'on' },
     preferredApps: {},
+    dropPathMode: 'default',
     updatedAt: 0
   };
   try {
@@ -89,6 +94,7 @@ export function loadSettings() {
         preferredApps: parsed?.preferredApps && typeof parsed.preferredApps === 'object' && !Array.isArray(parsed.preferredApps)
           ? parsed.preferredApps
           : {},
+        dropPathMode: normalizeDropPathMode(parsed?.dropPathMode),
         updatedAt: Number(parsed?.updatedAt || 0)
       };
     }
@@ -102,16 +108,23 @@ export function saveSettings(patch) {
   const next = {
     clientSettings: patch?.clientSettings
       ? {
-          menuMode: patch.clientSettings.menuMode === 'compact' ? 'compact' : 'full',
+          menuMode: patch.clientSettings.menuMode === undefined
+            ? current.clientSettings.menuMode
+            : (patch.clientSettings.menuMode === 'compact' ? 'compact' : 'full'),
           contextLines: [4, 8, 16].includes(Number(patch.clientSettings.contextLines))
             ? Number(patch.clientSettings.contextLines)
             : current.clientSettings.contextLines,
-          glass: patch.clientSettings.glass === 'off' ? 'off' : 'on'
+          glass: patch.clientSettings.glass === undefined
+            ? current.clientSettings.glass
+            : (patch.clientSettings.glass === 'off' ? 'off' : 'on')
         }
       : current.clientSettings,
     preferredApps: patch?.preferredApps && typeof patch.preferredApps === 'object' && !Array.isArray(patch.preferredApps)
       ? patch.preferredApps
       : current.preferredApps,
+    dropPathMode: patch?.dropPathMode !== undefined
+      ? normalizeDropPathMode(patch.dropPathMode)
+      : current.dropPathMode,
     updatedAt: Date.now()
   };
   fs.writeFileSync(SETTINGS_FILE, JSON.stringify(next, null, 2), 'utf8');
@@ -123,6 +136,10 @@ export function isBlockedNetworkOrDevicePath(rawPath) {
   if (!cleaned) return false;
   // Block Windows UNC paths (\\host\share, //host/share), extended/device paths (\\?\, \\.\)
   if (/^(?:[\\/]{2}|[\\/]\?[\\/]|[\\/]\.[\\/])/.test(cleaned)) {
+    return true;
+  }
+  // Block non-file URI schemes (e.g. ms-msdt:, search-ms:, http:) while preserving Windows drive letters (C:\)
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]+:/.test(cleaned) && !/^file:/i.test(cleaned)) {
     return true;
   }
   if (/^file:/i.test(cleaned)) {
@@ -515,7 +532,7 @@ export function parseCommandTemplate(commandRaw) {
   return { exe, argsTemplate: rest, raw: expanded };
 }
 
-function buildSpawnArgs(argsTemplate, absPath) {
+export function buildSpawnArgs(argsTemplate, absPath) {
   const raw = String(argsTemplate || '').trim();
   if (!raw) return [absPath];
   const tokens = [];
@@ -525,7 +542,7 @@ function buildSpawnArgs(argsTemplate, absPath) {
   while ((m = re.exec(raw))) {
     let tok = m[1] !== undefined ? m[1] : m[2];
     if (/%[1lL]\b/.test(tok) || tok === '%*') {
-      tok = tok.replace(/%[1lL*]/g, absPath);
+      tok = tok.replace(/%[1lL*]/g, () => absPath);
       replaced = true;
     }
     if (tok !== '') tokens.push(tok);
@@ -864,7 +881,9 @@ export async function revealInExplorer(absPath, shellApi) {
   } catch {}
   if (process.platform === 'win32') {
     try {
-      const child = spawn('explorer.exe', [`/select,${normalized}`], {
+      // Windows explorer.exe treats unescaped commas in `/select,<path>` as argument separators
+      const args = normalized.includes(',') ? [path.dirname(normalized)] : [`/select,${normalized}`];
+      const child = spawn('explorer.exe', args, {
         detached: true,
         stdio: 'ignore'
       });

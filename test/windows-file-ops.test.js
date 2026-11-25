@@ -6,6 +6,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import {
+  buildSpawnArgs,
   discoverApplications,
   expandWinEnv,
   isAbsoluteFsPath,
@@ -171,4 +172,10 @@ test('blocks UNC network paths, device paths, and remote file:// URIs', async ()
 
   assert.equal(await launchApplication('\\\\evil\\share\\secret.txt'), false);
   assert.equal(await revealInExplorer('//evil/share/secret.txt'), false);
+});
+
+test('buildSpawnArgs preserves literal $ sequences in Windows file paths', () => {
+  const weirdPath = 'C:\\work\\price$$1$&test$\'file.txt';
+  assert.deepEqual(buildSpawnArgs('"--open=%1"', weirdPath), [`--open=${weirdPath}`]);
+  assert.deepEqual(buildSpawnArgs('%1', weirdPath), [weirdPath]);
 });

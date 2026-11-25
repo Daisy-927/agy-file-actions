@@ -135,6 +135,17 @@ test('E2E in headless Edge: right-click menu on inline code, file:///#L lines, c
     <p>图片预览：<img id="media-svg" src="${pathToFileURL(svgPath).href}" width="40" height="40" alt="chart.svg"></p>
     <p>外部文档：<a id="web-link" href="https://github.com/jidekaixin2dian/dsh-file-actions">dsh-file-actions</a></p>
   </div>
+  <div id="drop-scope" data-media-drop-scope="" style="margin-top:20px;">
+    <div id="chat-editor" data-lexical-editor="true" contenteditable="true" style="min-height:48px;border:1px solid #ccc;padding:8px;"></div>
+  </div>
+  <script>
+    window.__nativeDroppedBatches = [];
+    window.addEventListener('drop', (ev) => {
+      if (ev.dataTransfer?.files?.length) {
+        window.__nativeDroppedBatches.push(Array.from(ev.dataTransfer.files).map((f) => f.name));
+      }
+    });
+  </script>
 </body>
 </html>`);
       return;
@@ -394,6 +405,139 @@ ${overlaySrc}
     assert.ok(mRgb, `Expected rgb() background in dark mode, got ${darkBg}`);
     assert.ok(Number(mRgb[1]) < 60 && Number(mRgb[2]) < 60 && Number(mRgb[3]) < 60, `Expected dark floor, got ${darkBg}`);
 
+    // 7. Verify drag-drop local path fallback across default, always (纯路径), and off modes
+    const dropResults = await cdp.call('Runtime.evaluate', {
+      expression: `(() => {
+        const pathMap = new WeakMap();
+        window.electronNative = { getPathForFile: (f) => pathMap.get(f) || '' };
+        const editor = document.getElementById('chat-editor');
+        const makeFile = (spec) => {
+          const f = new File([new Uint8Array(16)], spec.name, { type: spec.type || '' });
+          Object.defineProperty(f, 'size', { value: spec.size });
+          if (spec.absPath) pathMap.set(f, spec.absPath);
+          return f;
+        };
+        const dropSpecs = (specs, leadingText) => {
+          const dt = new DataTransfer();
+          if (leadingText) dt.items.add(leadingText, 'text/plain');
+          for (const s of specs) dt.items.add(makeFile(s));
+          const ev = new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt });
+          editor.dispatchEvent(ev);
+        };
+
+        // 7a. default: small image + small code + .env dotfile (even with leading string item) pass natively
+        window.__nativeDroppedBatches = [];
+        editor.textContent = '';
+        dropSpecs([
+          { name: 'shot.png', type: 'image/png', size: 4096, absPath: 'E:\\\\pics\\\\shot.png' },
+          { name: 'app.ts', type: 'text/plain', size: 1024, absPath: 'E:\\\\src\\\\app.ts' },
+          { name: '.env', type: '', size: 128, absPath: 'E:\\\\src\\\\.env' }
+        ], 'text/uri-list-placeholder');
+        const rNative = {
+          batches: [...window.__nativeDroppedBatches],
+          text: editor.innerText.trim()
+        };
+
+        // 7b. default: oversized PDF/ZIP + unsupported .exe -> inserted one per line, quoted on spaces
+        window.__nativeDroppedBatches = [];
+        editor.textContent = '';
+        dropSpecs([
+          { name: 'big.pdf', type: 'application/pdf', size: 15 * 1024 * 1024, absPath: 'E:\\\\docs\\\\big.pdf' },
+          { name: 'huge.zip', type: 'application/zip', size: 25 * 1024 * 1024, absPath: 'E:\\\\pack\\\\huge.zip' },
+          { name: 'setup.exe', type: 'application/octet-stream', size: 512000, absPath: 'D:\\\\My Tools\\\\setup.exe' }
+        ]);
+        const rFallback = {
+          batches: [...window.__nativeDroppedBatches],
+          text: editor.innerText.trim().replace(/\\r\\n/g, '\\n')
+        };
+
+        // 7c. cursor after space in middle of text should not insert a stray leading newline
+        window.__nativeDroppedBatches = [];
+        editor.textContent = 'hello world';
+        const rMid = window.getSelection();
+        const midRange = document.createRange();
+        midRange.setStart(editor.firstChild, 6);
+        midRange.collapse(true);
+        rMid.removeAllRanges();
+        rMid.addRange(midRange);
+        dropSpecs([
+          { name: 'mod.7z', type: '', size: 4096, absPath: 'E:\\\\arch\\\\mod.7z' }
+        ]);
+        const rMidCursor = {
+          text: editor.innerText.trim()
+        };
+
+        // 7c2. forward non-collapsed selection replacement checks selection start, avoiding extra \n
+        window.__nativeDroppedBatches = [];
+        editor.textContent = 'hello placeholder';
+        const selObj = window.getSelection();
+        const selRange = document.createRange();
+        selRange.setStart(editor.firstChild, 6);
+        selRange.setEnd(editor.firstChild, 17);
+        selObj.removeAllRanges();
+        selObj.addRange(selRange);
+        dropSpecs([
+          { name: 'rep.7z', type: '', size: 4096, absPath: 'E:\\\\arch\\\\rep.7z' }
+        ]);
+        const rReplaceSel = {
+          text: editor.innerText.trim()
+        };
+
+        // 7d. default mixed: small.png stays native + extra.7z inserts path
+        window.__nativeDroppedBatches = [];
+        editor.textContent = '';
+        dropSpecs([
+          { name: 'small.png', type: 'image/png', size: 2048, absPath: 'E:\\\\pics\\\\small.png' },
+          { name: 'extra.7z', type: '', size: 4096, absPath: 'E:\\\\arch\\\\extra.7z' }
+        ]);
+        const rMixed = {
+          batches: [...window.__nativeDroppedBatches],
+          text: editor.innerText.trim()
+        };
+
+        // 7e. always (纯路径): small code inserts path while small.png stays native
+        globalThis.__AGY_FA_BRIDGE__.applyHostSettings({ dropPathMode: 'always' });
+        window.__nativeDroppedBatches = [];
+        editor.textContent = '';
+        dropSpecs([
+          { name: 'note.png', type: 'image/png', size: 2048, absPath: 'E:\\\\pics\\\\note.png' },
+          { name: 'index.ts', type: 'text/plain', size: 512, absPath: 'E:\\\\src\\\\index.ts' }
+        ]);
+        const rAlways = {
+          batches: [...window.__nativeDroppedBatches],
+          text: editor.innerText.trim()
+        };
+
+        // 7f. off: even unsupported .exe passes straight through without inserting text
+        globalThis.__AGY_FA_BRIDGE__.applyHostSettings({ dropPathMode: 'off' });
+        window.__nativeDroppedBatches = [];
+        editor.textContent = '';
+        dropSpecs([
+          { name: 'raw.exe', type: '', size: 50 * 1024 * 1024, absPath: 'E:\\\\bin\\\\raw.exe' }
+        ]);
+        const rOff = {
+          batches: [...window.__nativeDroppedBatches],
+          text: editor.innerText.trim()
+        };
+
+        return { rNative, rFallback, rMidCursor, rReplaceSel, rMixed, rAlways, rOff };
+      })()`,
+      returnByValue: true
+    });
+    const dRes = dropResults.result?.value;
+    assert.deepEqual(dRes.rNative.batches, [['shot.png', 'app.ts', '.env']]);
+    assert.equal(dRes.rNative.text, '');
+    assert.deepEqual(dRes.rFallback.batches, []);
+    assert.equal(dRes.rFallback.text, 'E:\\docs\\big.pdf\nE:\\pack\\huge.zip\n"D:\\My Tools\\setup.exe"');
+    assert.equal(dRes.rMidCursor.text, 'hello E:\\arch\\mod.7zworld');
+    assert.equal(dRes.rReplaceSel.text, 'hello E:\\arch\\rep.7z');
+    assert.deepEqual(dRes.rMixed.batches, [['small.png']]);
+    assert.equal(dRes.rMixed.text, 'E:\\arch\\extra.7z');
+    assert.deepEqual(dRes.rAlways.batches, [['note.png']]);
+    assert.equal(dRes.rAlways.text, 'E:\\src\\index.ts');
+    assert.deepEqual(dRes.rOff.batches, [['raw.exe']]);
+    assert.equal(dRes.rOff.text, '');
+
     pumpStop = true;
     await cdp.call('Runtime.evaluate', { expression: `globalThis.__AGY_FILE_ACTIONS_OVERLAY__?.stop?.()` }).catch(() => {});
     await pumpLoop.catch(() => {});
@@ -457,6 +601,8 @@ test('Sidecar server enforces CSRF token on GET/POST, CSP headers, symlink root 
     assert.match(htmlRes.headers.get('content-security-policy') || '', /frame-ancestors https:\/\/127\.0\.0\.1:\* http:\/\/127\.0\.0\.1:\*/);
     const html = await htmlRes.text();
     assert.match(html, /文件与链接操作/);
+    assert.match(html, /id="sel-drop-path-mode"/);
+    assert.match(html, /默认.*纯路径.*关闭/s);
     const tokenMatch = /name="agy-fa-token" content="([0-9a-f]+)"/.exec(html);
     assert.ok(tokenMatch, 'Expected embedded CSRF token in ui.html');
     const token = tokenMatch[1];
@@ -509,23 +655,38 @@ test('Sidecar server enforces CSRF token on GET/POST, CSP headers, symlink root 
     const saved = await (await fetch(`${base}/api/settings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-AGY-FA-Token': token },
-      body: JSON.stringify({ clientSettings: { menuMode: 'compact', contextLines: 16 } })
+      body: JSON.stringify({ clientSettings: { menuMode: 'compact', contextLines: 16, glass: 'off' }, dropPathMode: 'always' })
     })).json();
     assert.equal(saved.ok, true);
     assert.equal(saved.settings.clientSettings.menuMode, 'compact');
     assert.equal(saved.settings.clientSettings.contextLines, 16);
+    assert.equal(saved.settings.clientSettings.glass, 'off');
+    assert.equal(saved.settings.dropPathMode, 'always');
+
+    // Updating clientSettings without dropPathMode, menuMode, or glass must preserve existing values
+    const savedPreserved = await (await fetch(`${base}/api/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-AGY-FA-Token': token },
+      body: JSON.stringify({ clientSettings: { contextLines: 8 } })
+    })).json();
+    assert.equal(savedPreserved.ok, true);
+    assert.equal(savedPreserved.settings.dropPathMode, 'always');
+    assert.equal(savedPreserved.settings.clientSettings.menuMode, 'compact');
+    assert.equal(savedPreserved.settings.clientSettings.glass, 'off');
 
     const gotSettings = await (await fetch(`${base}/api/settings`, {
       headers: { 'X-AGY-FA-Token': token }
     })).json();
     assert.equal(gotSettings.ok, true);
     assert.equal(gotSettings.settings.clientSettings.menuMode, 'compact');
+    assert.equal(gotSettings.settings.dropPathMode, 'always');
 
     const status = await (await fetch(`${base}/api/status`, {
       headers: { 'X-AGY-FA-Token': token }
     })).json();
     assert.equal(status.ok, true);
     assert.equal(status.settings.clientSettings.menuMode, 'compact');
+    assert.equal(status.settings.dropPathMode, 'always');
   } finally {
     try { proc.kill(); } catch {}
     fs.rmSync(tmpAppData, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
@@ -568,11 +729,12 @@ test('preview-server renders valid trust link without onclick truncation and set
   }
 });
 
-test('runtime-injector previewInBrowser opens shared sandboxed preview URL instead of raw file', async () => {
+test('runtime-injector previewInBrowser uses shared preview URL and blocks non-file URI fallback', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fa-cdp-preview-'));
   const htmlFile = path.join(tmp, 'report.html');
   fs.writeFileSync(htmlFile, '<p>Report</p>', 'utf8');
   let openedUrl = '';
+  let launchedRaw = '';
   try {
     const res = await handleRpc(
       { method: 'previewInBrowser', params: { path: htmlFile }, conversationId: '11111111-2222-3333-4444-555555555555' },
@@ -583,6 +745,14 @@ test('runtime-injector previewInBrowser opens shared sandboxed preview URL inste
     assert.match(openedUrl, /^http:\/\/127\.0\.0\.1:\d+\/preview\?token=/);
     const previewRes = await fetch(openedUrl);
     assert.equal(previewRes.status, 200);
+
+    const blockedRes = await handleRpc(
+      { method: 'open', params: { path: 'ms-msdt:/id PCWDiagnostic' }, conversationId: '' },
+      '',
+      { shell: { openPath: (p) => { launchedRaw = p; return ''; } } }
+    );
+    assert.equal(blockedRes.ok, false);
+    assert.equal(launchedRaw, '');
   } finally {
     await closePreviewServer();
     fs.rmSync(tmp, { recursive: true, force: true });
