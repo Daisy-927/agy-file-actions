@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
@@ -17,6 +17,7 @@ export const BRAIN_DIR = path.join(APP_DATA_DIR, 'brain');
 export const PLUGIN_DATA_DIR = path.join(APP_DATA_DIR, 'plugin_data', 'agy-file-actions');
 export const SETTINGS_FILE = path.join(PLUGIN_DATA_DIR, 'settings.json');
 export const STATUS_FILE = path.join(PLUGIN_DATA_DIR, 'direct_loader_status.json');
+export const CDP_STATUS_FILE = path.join(PLUGIN_DATA_DIR, 'cdp_loader_status.json');
 
 const TEXT_LIKE_EXTS = new Set([
   '.txt', '.md', '.markdown', '.mdx', '.json', '.jsonl', '.ndjson', '.jsonc', '.json5',
@@ -131,32 +132,244 @@ export function saveSettings(patch) {
   return next;
 }
 
+const WSL_HOSTS = new Set(['wsl.localhost', 'wsl$']);
+const INVALID_DISTRO_RE = /[<>:"/\\|?*\x00-\x1f]/;
+
+function normalizePosixSubpath(subpath) {
+  const raw = String(subpath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!raw) return '/';
+  return path.posix.normalize(`/${raw}`);
+}
+
+export function buildWslUncPath(distro, posixSubpath = '/', host = 'wsl.localhost') {
+  const safeHost = WSL_HOSTS.has(String(host || '').toLowerCase()) ? String(host).toLowerCase() : 'wsl.localhost';
+  const safeDistro = String(distro || '').trim();
+  if (!safeDistro || safeDistro === '.' || safeDistro === '..' || INVALID_DISTRO_RE.test(safeDistro)) {
+    return '';
+  }
+  const normSub = normalizePosixSubpath(posixSubpath);
+  const winSub = normSub === '/' ? '\\' : normSub.replace(/\//g, '\\');
+  return `\\\\${safeHost}\\${safeDistro}${winSub}`;
+}
+
+export function parseWslUncPath(rawPath) {
+  const cleaned = String(rawPath || '').trim().replace(/^['"]+|['"]+$/g, '');
+  const match = /^(?:\\\\|\/\/)([^\\/]+)[\\/]([^\\/]+)(?:([\\/].*))?$/.exec(cleaned);
+  if (!match) return null;
+  const host = String(match[1] || '').toLowerCase();
+  if (!WSL_HOSTS.has(host)) return null;
+  const distro = String(match[2] || '').trim();
+  if (!distro || distro === '.' || distro === '..' || INVALID_DISTRO_RE.test(distro)) return null;
+  const posixPath = normalizePosixSubpath(match[3] || '/');
+  const winPath = buildWslUncPath(distro, posixPath, host);
+  if (!winPath) return null;
+  return {
+    host,
+    distro,
+    mountRoot: `\\\\${host}\\${distro}`,
+    posixPath,
+    winPath
+  };
+}
+
+export function parseWslUri(rawUri) {
+  const value = String(rawUri || '').trim().replace(/^['"]+|['"]+$/g, '');
+  if (!value) return null;
+  try {
+    let targetUrl;
+    let isRemoteKind = false;
+    if (/^file:\/\//i.test(value)) {
+      targetUrl = new URL(value);
+    } else if (/^wsl:\/\//i.test(value)) {
+      targetUrl = new URL(value);
+      const distro = decodeURIComponent(targetUrl.hostname || '').trim();
+      if (!distro || distro === '.' || distro === '..' || INVALID_DISTRO_RE.test(distro)) return null;
+      const posixPath = normalizePosixSubpath(decodeURIComponent(targetUrl.pathname || '/'));
+      const winPath = buildWslUncPath(distro, posixPath, 'wsl.localhost');
+      if (!winPath) return null;
+      return {
+        host: 'wsl.localhost',
+        distro,
+        mountRoot: `\\\\wsl.localhost\\${distro}`,
+        posixPath,
+        winPath,
+        hash: targetUrl.hash || ''
+      };
+    } else if (/^(?:vscode-remote|antigravity-remote):\/\//i.test(value)) {
+      targetUrl = new URL(value);
+      isRemoteKind = true;
+    } else if (/^(?:vscode-file|antigravity):\/\/vscode-remote\//i.test(value)) {
+      targetUrl = new URL(value.replace(/^(?:vscode-file|antigravity):\/\/vscode-remote/i, 'vscode-remote://'));
+      isRemoteKind = true;
+    } else {
+      return null;
+    }
+
+    if (isRemoteKind) {
+      let authority = '';
+      let rawPosix = '/';
+      if (targetUrl.hostname) {
+        authority = decodeURIComponent(targetUrl.hostname);
+        rawPosix = decodeURIComponent(targetUrl.pathname || '/');
+      } else {
+        const m = /^\/([^/]+)(\/.*)?$/.exec(targetUrl.pathname || '');
+        if (!m) return null;
+        authority = decodeURIComponent(m[1]);
+        rawPosix = decodeURIComponent(m[2] || '/');
+      }
+      const wslMatch = /^wsl\+(.+)$/i.exec(authority);
+      if (!wslMatch) return null;
+      const distro = wslMatch[1].trim();
+      const posixPath = normalizePosixSubpath(rawPosix);
+      const winPath = buildWslUncPath(distro, posixPath, 'wsl.localhost');
+      if (!winPath) return null;
+      return {
+        host: 'wsl.localhost',
+        distro,
+        mountRoot: `\\\\wsl.localhost\\${distro}`,
+        posixPath,
+        winPath,
+        hash: targetUrl.hash || ''
+      };
+    }
+
+    const host = String(targetUrl.hostname || '').toLowerCase();
+    if (!WSL_HOSTS.has(host)) return null;
+    const decodedPath = decodeURIComponent(targetUrl.pathname || '');
+    const m = /^\/([^/]+)(\/.*)?$/.exec(decodedPath);
+    if (!m) return null;
+    const distro = m[1].trim();
+    const posixPath = normalizePosixSubpath(m[2] || '/');
+    const winPath = buildWslUncPath(distro, posixPath, host);
+    if (!winPath) return null;
+    return {
+      host,
+      distro,
+      mountRoot: `\\\\${host}\\${distro}`,
+      posixPath,
+      winPath,
+      hash: targetUrl.hash || ''
+    };
+  } catch {
+    return null;
+  }
+}
+
+const wslHostCache = new Map();
+
+export function resolvePreferredWslMountPath(distro, posixSubpath = '/', options = {}) {
+  const safeDistro = String(distro || '').trim();
+  const useCache = typeof options.existsSync !== 'function';
+  if (useCache && safeDistro) {
+    const cached = wslHostCache.get(safeDistro.toLowerCase());
+    if (cached && Date.now() - cached.at < 30000) {
+      return buildWslUncPath(safeDistro, posixSubpath, cached.host);
+    }
+  }
+  const existsFn = useCache ? fs.existsSync : options.existsSync;
+  const localhostRoot = buildWslUncPath(safeDistro, '/', 'wsl.localhost');
+  if (!localhostRoot) return '';
+  let chosenHost = 'wsl.localhost';
+  if (!existsFn(localhostRoot)) {
+    const legacyRoot = buildWslUncPath(safeDistro, '/', 'wsl$');
+    if (legacyRoot && existsFn(legacyRoot)) chosenHost = 'wsl$';
+  }
+  if (useCache && safeDistro) {
+    wslHostCache.set(safeDistro.toLowerCase(), { host: chosenHost, at: Date.now() });
+  }
+  return buildWslUncPath(safeDistro, posixSubpath, chosenHost);
+}
+
+let cachedDefaultWslDistro = { value: null, at: 0 };
+
+export function getDefaultWslDistro(options = {}) {
+  const explicit = String(options.defaultWslDistro || process.env.AGY_WSL_DISTRO || '').trim();
+  if (explicit) {
+    return !INVALID_DISTRO_RE.test(explicit) && explicit !== '.' && explicit !== '..' ? explicit : '';
+  }
+  if (typeof options.defaultWslDistro === 'string') return '';
+  if (process.platform !== 'win32') return '';
+  if (cachedDefaultWslDistro.value !== null && Date.now() - cachedDefaultWslDistro.at < 60000) {
+    return cachedDefaultWslDistro.value;
+  }
+  let distro = '';
+  try {
+    const baseOut = execFileSync(
+      'reg.exe',
+      ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss', '/v', 'DefaultDistribution'],
+      { encoding: 'utf8', timeout: 700, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] }
+    );
+    const guidMatch = /DefaultDistribution\s+REG_SZ\s+(\{[^}\r\n]+\})/i.exec(baseOut);
+    if (guidMatch) {
+      const subOut = execFileSync(
+        'reg.exe',
+        ['query', `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\${guidMatch[1]}`, '/v', 'DistributionName'],
+        { encoding: 'utf8', timeout: 700, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] }
+      );
+      const nameMatch = /DistributionName\s+REG_SZ\s+([^\r\n]+)/i.exec(subOut);
+      const candidate = String(nameMatch?.[1] || '').trim();
+      if (candidate && candidate !== '.' && candidate !== '..' && !INVALID_DISTRO_RE.test(candidate)) {
+        distro = candidate;
+      }
+    }
+  } catch {}
+  cachedDefaultWslDistro = { value: distro, at: Date.now() };
+  return distro;
+}
+
+function mapPosixPathWithWsl(posixPath, options = {}) {
+  const normPosix = normalizePosixSubpath(posixPath);
+  const mntMatch = /^\/mnt\/([a-zA-Z])(?:\/(.*))?$/.exec(normPosix);
+  if (mntMatch) {
+    const drive = mntMatch[1].toUpperCase();
+    const restWin = (mntMatch[2] || '').replace(/\//g, '\\');
+    return path.normalize(`${drive}:\\${restWin}`);
+  }
+  const distro = getDefaultWslDistro(options);
+  if (!distro) return '';
+  return resolvePreferredWslMountPath(distro, normPosix, options);
+}
+
+export function normalizeAllowedPath(rawPath) {
+  const wsl = parseWslUncPath(rawPath);
+  if (wsl) return wsl.winPath;
+  return path.normalize(String(rawPath || ''));
+}
+
 export function isBlockedNetworkOrDevicePath(rawPath) {
   const cleaned = String(rawPath || '').trim().replace(/^['"]+|['"]+$/g, '');
   if (!cleaned) return false;
-  // Block Windows UNC paths (\\host\share, //host/share), extended/device paths (\\?\, \\.\)
-  if (/^(?:[\\/]{2}|[\\/]\?[\\/]|[\\/]\.[\\/])/.test(cleaned)) {
+  // Block extended/device namespace paths (\\?\, \\.\)
+  if (/^(?:[\\/]\?[\\/]|[\\/]\.[\\/])/.test(cleaned)) {
     return true;
   }
-  // Block non-file URI schemes (e.g. ms-msdt:, search-ms:, http:) while preserving Windows drive letters (C:\)
-  if (/^[a-zA-Z][a-zA-Z0-9+.-]+:/.test(cleaned) && !/^file:/i.test(cleaned)) {
-    return true;
+  // Block UNC paths (\\host\share, //host/share), except local WSL 9P mounts
+  if (/^[\\/]{2}/.test(cleaned)) {
+    return parseWslUncPath(cleaned) === null;
   }
-  if (/^file:/i.test(cleaned)) {
-    try {
-      const parsed = new URL(cleaned);
-      const host = String(parsed.hostname || '').toLowerCase();
-      if (host && host !== 'localhost') return true;
-    } catch {
-      return true;
+  // Block non-file URIs except allowlisted WSL remote URIs; preserve Windows drive letters (C:\)
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]+:/.test(cleaned)) {
+    if (parseWslUri(cleaned)) return false;
+    if (/^file:/i.test(cleaned)) {
+      try {
+        const parsed = new URL(cleaned);
+        const host = String(parsed.hostname || '').toLowerCase();
+        if (host && host !== 'localhost') return true;
+        return false;
+      } catch {
+        return true;
+      }
     }
+    return true;
   }
   return false;
 }
 
 export function isAbsoluteFsPath(value) {
   if (isBlockedNetworkOrDevicePath(value)) return false;
-  return /^(?:[A-Za-z]:[\\/]|\/(?![\\/]))/.test(String(value || '').trim());
+  const trimmed = String(value || '').trim();
+  if (parseWslUncPath(trimmed) || parseWslUri(trimmed)) return true;
+  return /^(?:[A-Za-z]:[\\/]|\/(?![\\/]))/.test(trimmed);
 }
 
 export function sanitizeConversationId(conversationId) {
@@ -165,7 +378,7 @@ export function sanitizeConversationId(conversationId) {
   return raw;
 }
 
-function parseWorkspaceUris(rawUris) {
+export function parseWorkspaceUris(rawUris, options = {}) {
   let uris = [];
   if (Array.isArray(rawUris)) {
     uris = rawUris;
@@ -178,15 +391,54 @@ function parseWorkspaceUris(rawUris) {
   const result = [];
   for (const uri of uris) {
     if (typeof uri !== 'string' || !uri.trim()) continue;
+    const trimmed = uri.trim();
+    const wslUri = parseWslUri(trimmed);
+    if (wslUri) {
+      const resolved = /^(?:file:)/i.test(trimmed)
+        ? wslUri.winPath
+        : resolvePreferredWslMountPath(wslUri.distro, wslUri.posixPath, options);
+      if (resolved) result.push(resolved);
+      continue;
+    }
+    const wslUnc = parseWslUncPath(trimmed);
+    if (wslUnc) {
+      result.push(wslUnc.winPath);
+      continue;
+    }
     try {
-      const fsPath = uri.startsWith('file://') ? fileURLToPath(uri) : uri;
-      if (fsPath) result.push(path.normalize(fsPath));
+      let fsPath = '';
+      if (/^file:\/\//i.test(trimmed)) {
+        const parsedFile = new URL(trimmed);
+        const host = String(parsedFile.hostname || '').toLowerCase();
+        if (host && host !== 'localhost') continue;
+        const decodedPathname = decodeURIComponent(parsedFile.pathname || '');
+        if (process.platform === 'win32' && /^\/(?![\\/]|[A-Za-z]:[\\/])/.test(decodedPathname)) {
+          const mappedPosix = mapPosixPathWithWsl(decodedPathname, options);
+          if (mappedPosix) {
+            result.push(mappedPosix);
+            continue;
+          }
+        }
+        fsPath = fileURLToPath(trimmed);
+      } else if (process.platform === 'win32' && /^\/(?![\\/]|[A-Za-z]:[\\/])/.test(trimmed)) {
+        const mappedPosix = mapPosixPathWithWsl(trimmed, options);
+        if (mappedPosix) {
+          result.push(mappedPosix);
+          continue;
+        }
+        fsPath = trimmed;
+      } else {
+        fsPath = trimmed;
+      }
+      if (fsPath && !isBlockedNetworkOrDevicePath(fsPath)) {
+        result.push(path.normalize(fsPath));
+      }
     } catch {}
   }
   return result;
 }
 
-function readConversationWorkspaces(conversationId, dbPath = SUMMARIES_DB_PATH) {
+function readConversationWorkspaces(conversationId, dbPath = SUMMARIES_DB_PATH, options = {}) {
   const cid = sanitizeConversationId(conversationId);
   if (!cid || !fs.existsSync(dbPath)) return [];
   let db;
@@ -195,7 +447,7 @@ function readConversationWorkspaces(conversationId, dbPath = SUMMARIES_DB_PATH) 
     const row = db
       .prepare('SELECT workspace_uris FROM conversation_summaries WHERE conversation_id = ?')
       .get(cid);
-    return row ? parseWorkspaceUris(row.workspace_uris) : [];
+    return row ? parseWorkspaceUris(row.workspace_uris, options) : [];
   } catch {
     return [];
   } finally {
@@ -207,7 +459,7 @@ export function resolveConversationContext(conversationId, pageUrl = '', options
   const cid = sanitizeConversationId(conversationId);
   const dbPath = options.summariesDbPath || SUMMARIES_DB_PATH;
   const brainBase = options.brainDir || BRAIN_DIR;
-  const workspacePaths = readConversationWorkspaces(cid, dbPath);
+  const workspacePaths = readConversationWorkspaces(cid, dbPath, options);
 
   let projectParam = '';
   if (pageUrl) {
@@ -216,10 +468,12 @@ export function resolveConversationContext(conversationId, pageUrl = '', options
       projectParam = parsed.searchParams.get('project') || '';
     } catch {}
   }
-  if (projectParam && projectParam !== 'outside-of-project' && isAbsoluteFsPath(projectParam)) {
-    const norm = path.normalize(projectParam);
-    if (!workspacePaths.some((p) => p.toLowerCase() === norm.toLowerCase())) {
-      workspacePaths.unshift(norm);
+  if (projectParam && projectParam !== 'outside-of-project' && !isBlockedNetworkOrDevicePath(projectParam)) {
+    const mappedProject = parseWorkspaceUris([projectParam], options)[0];
+    if (mappedProject && isAbsoluteFsPath(mappedProject)) {
+      if (!workspacePaths.some((p) => p.toLowerCase() === mappedProject.toLowerCase())) {
+        workspacePaths.unshift(mappedProject);
+      }
     }
   }
 
@@ -251,7 +505,7 @@ export function resolveConversationContext(conversationId, pageUrl = '', options
   const seen = new Set();
   const roots = [];
   for (const r of rawRoots) {
-    const norm = path.normalize(r);
+    const norm = normalizeAllowedPath(r);
     const key = process.platform === 'win32' ? norm.toLowerCase() : norm;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -262,21 +516,101 @@ export function resolveConversationContext(conversationId, pageUrl = '', options
     } catch {}
   }
 
+  const wslMeta = parseWslUncPath(preferredWorkspace)
+    || workspacePaths.map((p) => parseWslUncPath(p)).find(Boolean)
+    || (options.wslMountRoot ? parseWslUncPath(options.wslMountRoot) : null);
+
   return {
     id: cid || 'default',
     cwd: primaryCwd,
     roots,
     brainDir: brainDir && fs.existsSync(brainDir) ? brainDir : '',
-    outsideProject: !preferredWorkspace
+    outsideProject: !preferredWorkspace,
+    wsl: wslMeta ? { host: wslMeta.host, distro: wslMeta.distro, mountRoot: wslMeta.mountRoot } : null
   };
 }
 
-export function resolveCandidatePaths(rawPath, roots = []) {
+function collectWslMounts(roots = [], ctx = null) {
+  const mounts = [];
+  const seen = new Set();
+  const addMount = (meta) => {
+    if (!meta || !meta.mountRoot) return;
+    const key = meta.mountRoot.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    mounts.push(meta);
+  };
+  if (ctx?.wsl?.distro) {
+    addMount({
+      host: ctx.wsl.host || 'wsl.localhost',
+      distro: ctx.wsl.distro,
+      mountRoot: ctx.wsl.mountRoot || `\\\\${ctx.wsl.host || 'wsl.localhost'}\\${ctx.wsl.distro}`
+    });
+  }
+  for (const r of roots || []) {
+    const meta = parseWslUncPath(r);
+    if (meta) addMount(meta);
+  }
+  return mounts;
+}
+
+export function resolveCandidatePaths(rawPath, roots = [], ctx = null) {
   let cleaned = String(rawPath || '').trim().replace(/^['"]+|['"]+$/g, '');
   if (!cleaned || isBlockedNetworkOrDevicePath(cleaned)) return [];
 
+  const wslUri = parseWslUri(cleaned);
+  if (wslUri) {
+    const resolved = /^file:/i.test(cleaned)
+      ? wslUri.winPath
+      : resolvePreferredWslMountPath(wslUri.distro, wslUri.posixPath);
+    return resolved ? [resolved] : [];
+  }
+
+  const wslUnc = parseWslUncPath(cleaned);
+  if (wslUnc) {
+    return [wslUnc.winPath];
+  }
+
+  // Decode plain local file:/// URIs (including POSIX file:///home/... in WSL sessions)
+  if (/^file:\/\//i.test(cleaned)) {
+    try {
+      const parsedFile = new URL(cleaned);
+      const host = String(parsedFile.hostname || '').toLowerCase();
+      if (host && host !== 'localhost') return [];
+      const decodedPathname = decodeURIComponent(parsedFile.pathname || '');
+      if (decodedPathname) cleaned = decodedPathname;
+    } catch {
+      return [];
+    }
+  }
+
+  const wslMounts = collectWslMounts(roots, ctx);
+
   if (cleaned === '~' || cleaned.startsWith('~/') || cleaned.startsWith('~\\')) {
-    cleaned = path.join(USER_HOME, cleaned.slice(1).replace(/^[\\/]+/, ''));
+    const subRel = cleaned.slice(1).replace(/^[\\/]+/, '');
+    const candidates = [];
+    const seenHome = new Set();
+    const pushHome = (p) => {
+      if (!p) return;
+      const k = process.platform === 'win32' ? p.toLowerCase() : p;
+      if (!seenHome.has(k)) {
+        seenHome.add(k);
+        candidates.push(p);
+      }
+    };
+    // Prefer active WSL Linux home (/home/<user>/...) when inside a WSL workspace
+    if (process.platform === 'win32' && wslMounts.length > 0) {
+      for (const r of [ctx?.cwd, ...(roots || [])].filter(Boolean)) {
+        const meta = parseWslUncPath(r);
+        const homeMatch = meta ? /^\/(home\/[^/]+|root)(?:\/|$)/.exec(meta.posixPath) : null;
+        if (meta && homeMatch) {
+          const targetPosix = subRel ? `/${homeMatch[1]}/${subRel.replace(/\\/g, '/')}` : `/${homeMatch[1]}`;
+          pushHome(buildWslUncPath(meta.distro, targetPosix, meta.host));
+        }
+      }
+    }
+    pushHome(path.join(USER_HOME, subRel));
+    return candidates;
   }
 
   // Handle /C:/foo style paths extracted from URLs
@@ -284,15 +618,58 @@ export function resolveCandidatePaths(rawPath, roots = []) {
     cleaned = cleaned.slice(1);
   }
 
+  // When chat links/text reference Linux POSIX paths (/home/... or /mnt/c/...),
+  // map them to native Windows drives (for /mnt/<drive>) and \\wsl.localhost\<distro>\... UNC mounts.
+  if (process.platform === 'win32' && /^\/(?![\\/])/.test(cleaned)) {
+    const candidates = [];
+    const seen = new Set();
+    const pushUnique = (p) => {
+      if (!p) return;
+      const k = p.toLowerCase();
+      if (!seen.has(k)) {
+        seen.add(k);
+        candidates.push(p);
+      }
+    };
+    const mntMatch = /^\/mnt\/([a-zA-Z])(?:\/(.*))?$/.exec(cleaned);
+    if (mntMatch) {
+      const drive = mntMatch[1].toUpperCase();
+      const restWin = (mntMatch[2] || '').replace(/\//g, '\\');
+      pushUnique(path.normalize(`${drive}:\\${restWin}`));
+    }
+    if (wslMounts.length > 0) {
+      for (const mount of wslMounts) {
+        pushUnique(buildWslUncPath(mount.distro, cleaned, mount.host));
+      }
+    } else if (/^\/(?:home|root|tmp|etc|var|opt|usr|srv|workspace|workspaces)(?:\/|$)/.test(cleaned)) {
+      const fallbackDistro = getDefaultWslDistro();
+      if (fallbackDistro) {
+        pushUnique(resolvePreferredWslMountPath(fallbackDistro, cleaned));
+      }
+    }
+    if (candidates.length > 0) {
+      pushUnique(path.normalize(cleaned));
+      return candidates;
+    }
+  }
+
   if (isAbsoluteFsPath(cleaned)) {
-    return [path.normalize(cleaned)];
+    return [normalizeAllowedPath(cleaned)];
   }
 
   const rel = cleaned.replace(/^\.[\\/]+/, '');
   const out = [];
   const seen = new Set();
   for (const root of roots) {
-    const candidate = path.resolve(root, rel);
+    const wslRoot = parseWslUncPath(root);
+    const candidate = wslRoot
+      ? buildWslUncPath(
+          wslRoot.distro,
+          path.posix.resolve(wslRoot.posixPath, rel.replace(/\\/g, '/')),
+          wslRoot.host
+        )
+      : normalizeAllowedPath(path.resolve(root, rel));
+    if (!candidate) continue;
     const key = process.platform === 'win32' ? candidate.toLowerCase() : candidate;
     if (!seen.has(key)) {
       seen.add(key);
@@ -302,8 +679,172 @@ export function resolveCandidatePaths(rawPath, roots = []) {
   return out;
 }
 
+export function isPidAlive(pid) {
+  const num = Number(pid);
+  if (!Number.isInteger(num) || num <= 0) return false;
+  try {
+    process.kill(num, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
+export async function probeCdpEndpoint(baseUrl, timeoutMs = 450) {
+  if (!baseUrl) return { reachable: false, targets: [] };
+  try {
+    const parsed = new URL(baseUrl);
+    const host = String(parsed.hostname || '').toLowerCase();
+    if (!['127.0.0.1', 'localhost', '::1', '[::1]'].includes(host)) {
+      return { reachable: false, targets: [] };
+    }
+    const cleanBase = baseUrl.replace(/\/+$/, '');
+    const res = await fetch(`${cleanBase}/json/list`, {
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    if (!res.ok) return { reachable: false, targets: [] };
+    const list = await res.json().catch(() => []);
+    return {
+      reachable: true,
+      baseUrl: cleanBase,
+      port: Number(parsed.port || 0),
+      targets: Array.isArray(list) ? list : []
+    };
+  } catch {
+    return { reachable: false, targets: [] };
+  }
+}
+
+export async function detectRuntimeLoaderStatus(options = {}) {
+  const statusFile = options.statusFile || STATUS_FILE;
+  const cdpStatusFile = options.cdpStatusFile || CDP_STATUS_FILE;
+  const checkPid = typeof options.isPidAlive === 'function' ? options.isPidAlive : isPidAlive;
+  const probeCdp = typeof options.probeCdpEndpoint === 'function' ? options.probeCdpEndpoint : probeCdpEndpoint;
+  const portFiles = options.portFiles || [
+    process.env.AGY_CDP_PORT_FILE,
+    path.join(process.env.APPDATA || path.join(USER_HOME, 'AppData', 'Roaming'), 'Antigravity', 'DevToolsActivePort'),
+    path.join(APP_DATA_DIR, 'DevToolsActivePort')
+  ].filter(Boolean);
+
+  let direct = null;
+  try {
+    if (fs.existsSync(statusFile)) {
+      direct = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
+    }
+  } catch {}
+
+  let staleElectron = false;
+  if (direct && typeof direct === 'object' && direct.active) {
+    const pid = Number(direct.pid);
+    if (Number.isInteger(pid) && pid > 0 && checkPid(pid)) {
+      return {
+        ...direct,
+        active: true,
+        mode: 'electron',
+        stale: false
+      };
+    }
+    staleElectron = true;
+  }
+
+  let cdpStatus = null;
+  try {
+    if (fs.existsSync(cdpStatusFile)) {
+      cdpStatus = JSON.parse(fs.readFileSync(cdpStatusFile, 'utf8'));
+    }
+  } catch {}
+
+  const cdpPid = Number(cdpStatus?.pid);
+  const cdpPidAlive = Number.isInteger(cdpPid) && cdpPid > 0 && checkPid(cdpPid);
+
+  // Collect candidate CDP endpoints in priority order so a stale cdp_loader_status.json URL
+  // never shadows a fresh DevToolsActivePort or default 9222 debugging port.
+  const endpointCandidates = [];
+  const seenEndpoints = new Set();
+  const pushEndpoint = (rawUrl) => {
+    const clean = String(rawUrl || '').trim().replace(/\/+$/, '');
+    if (!clean) return;
+    const key = clean.toLowerCase();
+    if (!seenEndpoints.has(key)) {
+      seenEndpoints.add(key);
+      endpointCandidates.push(clean);
+    }
+  };
+
+  if (process.env.AGY_CDP_URL) pushEndpoint(process.env.AGY_CDP_URL);
+  if (cdpPidAlive && cdpStatus?.cdpUrl) pushEndpoint(cdpStatus.cdpUrl);
+  for (const file of portFiles) {
+    try {
+      if (!fs.existsSync(file)) continue;
+      const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      const port = Number(lines[0]);
+      if (Number.isInteger(port) && port > 0 && port < 65536) {
+        pushEndpoint(`http://127.0.0.1:${port}`);
+      }
+    } catch {}
+  }
+  if (!cdpPidAlive && cdpStatus?.cdpUrl) pushEndpoint(cdpStatus.cdpUrl);
+  const fallbackEndpoints = Array.isArray(options.fallbackEndpoints)
+    ? options.fallbackEndpoints
+    : (options.portFiles ? [] : ['http://127.0.0.1:9222']);
+  for (const fb of fallbackEndpoints) pushEndpoint(fb);
+
+  let cdpEndpoint = '';
+  let cdpProbe = { reachable: false, targets: [] };
+  for (const candidate of endpointCandidates) {
+    const probed = await probeCdp(candidate);
+    if (probed.reachable) {
+      cdpEndpoint = candidate;
+      cdpProbe = probed;
+      break;
+    }
+  }
+
+  const probedPort = cdpProbe.port || (cdpEndpoint ? Number(new URL(cdpEndpoint).port || 0) : 0);
+  if (cdpStatus && cdpPidAlive && cdpProbe.reachable && (cdpStatus.active || cdpStatus.stage === 'waiting')) {
+    return {
+      ...cdpStatus,
+      active: true,
+      mode: 'cdp',
+      stage: cdpStatus.active ? (cdpStatus.stage || 'attached') : 'waiting',
+      stale: false,
+      cdpReady: true,
+      cdpPort: probedPort
+    };
+  }
+
+  if (cdpProbe.reachable) {
+    return {
+      active: false,
+      mode: 'cdp-unattached',
+      stale: Boolean(cdpStatus?.active && !cdpPidAlive) || staleElectron,
+      cdpReady: true,
+      cdpPort: probedPort,
+      reason: 'cdp-port-open-injector-not-running'
+    };
+  }
+
+  if (staleElectron || (cdpStatus && cdpStatus.active && !cdpPidAlive)) {
+    return {
+      active: false,
+      mode: staleElectron ? 'electron' : 'cdp',
+      stale: true,
+      cdpReady: false,
+      reason: 'process-exited'
+    };
+  }
+
+  return {
+    active: false,
+    mode: 'none',
+    stale: false,
+    cdpReady: false,
+    reason: 'not-injected'
+  };
+}
+
 export async function statFile(ctx, rawPath) {
-  const candidates = resolveCandidatePaths(rawPath, ctx?.roots || []);
+  const candidates = resolveCandidatePaths(rawPath, ctx?.roots || [], ctx);
   if (!candidates.length) return { ok: false, error: { code: 'not-found' } };
 
   let lastErrorCode = 'not-found';
@@ -336,7 +877,7 @@ export async function statFile(ctx, rawPath) {
 }
 
 export async function listDir(ctx, rawPath) {
-  const candidates = resolveCandidatePaths(rawPath, ctx?.roots || []);
+  const candidates = resolveCandidatePaths(rawPath, ctx?.roots || [], ctx);
   if (!candidates.length) return { ok: false, error: { code: 'not-found' } };
 
   for (const candidate of candidates) {
@@ -364,7 +905,7 @@ export async function listDir(ctx, rawPath) {
 }
 
 export async function readFileBytes(ctx, rawPath, options = {}) {
-  const candidates = resolveCandidatePaths(rawPath, ctx?.roots || []);
+  const candidates = resolveCandidatePaths(rawPath, ctx?.roots || [], ctx);
   const offset = Math.max(0, Math.floor(Number(options?.range?.offset || 0)));
   const maxChunk = 2 * 1024 * 1024;
   const length = Math.min(maxChunk, Math.max(1, Math.floor(Number(options?.range?.length || maxChunk))));
@@ -832,9 +1373,10 @@ export async function discoverApplications(absPath, options = {}) {
 
 export async function launchApplication(absPath, appId, shellApi) {
   if (!absPath || isBlockedNetworkOrDevicePath(absPath)) return false;
+  const safePath = normalizeAllowedPath(absPath);
   if (!appId) {
     if (shellApi && typeof shellApi.openPath === 'function') {
-      const errMsg = await shellApi.openPath(path.normalize(absPath));
+      const errMsg = await shellApi.openPath(safePath);
       return errMsg === '';
     }
     return false;
@@ -842,21 +1384,21 @@ export async function launchApplication(absPath, appId, shellApi) {
 
   let target = verifiedApps.get(appId);
   if (!target) {
-    await discoverApplications(absPath);
+    await discoverApplications(safePath);
     target = verifiedApps.get(appId);
   }
   if (!target) return false;
 
   if (target.uwpDefault) {
     if (shellApi && typeof shellApi.openPath === 'function') {
-      const errMsg = await shellApi.openPath(path.normalize(absPath));
+      const errMsg = await shellApi.openPath(safePath);
       return errMsg === '';
     }
     return false;
   }
 
   if (!target.exePath || !fs.existsSync(target.exePath)) return false;
-  const args = buildSpawnArgs(target.argsTemplate, path.normalize(absPath));
+  const args = buildSpawnArgs(target.argsTemplate, safePath);
   try {
     const child = spawn(target.exePath, args, {
       detached: true,
@@ -872,7 +1414,7 @@ export async function launchApplication(absPath, appId, shellApi) {
 
 export async function revealInExplorer(absPath, shellApi) {
   if (!absPath || isBlockedNetworkOrDevicePath(absPath)) return false;
-  const normalized = path.normalize(absPath);
+  const normalized = normalizeAllowedPath(absPath);
   try {
     if (shellApi && typeof shellApi.showItemInFolder === 'function') {
       shellApi.showItemInFolder(normalized);

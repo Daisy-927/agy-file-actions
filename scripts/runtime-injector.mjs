@@ -15,6 +15,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import {
+  CDP_STATUS_FILE,
   SETTINGS_FILE,
   discoverApplications,
   isBlockedNetworkOrDevicePath,
@@ -49,23 +50,33 @@ function isLoopbackHost(hostname) {
   return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
 }
 
-function readDevtoolsAddress() {
+function readDevtoolsAddresses() {
   const configured = String(process.env.AGY_CDP_URL || '').trim();
   if (configured) {
     const parsed = new URL(configured);
     if (!isLoopbackHost(parsed.hostname) || !['http:', 'https:'].includes(parsed.protocol)) {
       throw new Error('AGY_CDP_URL must point to a local http(s) endpoint');
     }
-    return configured.replace(/\/$/, '');
+    return [configured.replace(/\/$/, '')];
   }
+  const candidates = [];
+  const seen = new Set();
+  const push = (u) => {
+    const clean = String(u || '').replace(/\/$/, '');
+    if (clean && !seen.has(clean)) {
+      seen.add(clean);
+      candidates.push(clean);
+    }
+  };
   for (const file of PORT_FILES) {
     try {
       const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
       const port = Number(lines[0]);
-      if (Number.isInteger(port) && port > 0 && port < 65536) return `http://127.0.0.1:${port}`;
+      if (Number.isInteger(port) && port > 0 && port < 65536) push(`http://127.0.0.1:${port}`);
     } catch {}
   }
-  return '';
+  push('http://127.0.0.1:9222');
+  return candidates;
 }
 
 function getBundle() {
@@ -147,8 +158,19 @@ const shellFallback = {
   }
 };
 
-function resolveExistingCandidate(rawPath, roots) {
-  const candidates = resolveCandidatePaths(rawPath, roots);
+function writeCdpStatus(extra = {}) {
+  try {
+    fs.mkdirSync(path.dirname(CDP_STATUS_FILE), { recursive: true });
+    fs.writeFileSync(
+      CDP_STATUS_FILE,
+      JSON.stringify({ active: true, mode: 'cdp', pid: process.pid, updatedAt: new Date().toISOString(), ...extra }, null, 2),
+      'utf8'
+    );
+  } catch {}
+}
+
+function resolveExistingCandidate(rawPath, ctx) {
+  const candidates = resolveCandidatePaths(rawPath, ctx?.roots || [], ctx);
   if (!candidates.length) return '';
   return candidates.find((c) => fs.existsSync(c)) || candidates[0] || '';
 }
@@ -176,7 +198,7 @@ export async function handleRpc(req, targetUrl = '', options = {}) {
   const ctx = resolveConversationContext(cid, pageUrl);
   const shellApi = options.shell || shellFallback;
 
-  if (method === 'getSession') return { id: ctx.id, cwd: ctx.cwd, roots: ctx.roots, outsideProject: ctx.outsideProject };
+  if (method === 'getSession') return { id: ctx.id, cwd: ctx.cwd, roots: ctx.roots, outsideProject: ctx.outsideProject, wsl: ctx.wsl };
   if (method === 'getSettings') return loadSettings();
   if (method === 'saveSettings') return saveSettings(params);
   if (method === 'stat') return statFile(ctx, params.path);
@@ -184,20 +206,20 @@ export async function handleRpc(req, targetUrl = '', options = {}) {
   if (method === 'readBytes') return readFileBytes(ctx, params.path, params.options || {});
   if (method === 'applications') {
     const st = await statFile(ctx, params.path);
-    const absPath = st.ok ? st.value.absolutePath : resolveExistingCandidate(params.path, ctx.roots);
+    const absPath = st.ok ? st.value.absolutePath : resolveExistingCandidate(params.path, ctx);
     if (!absPath) return { ok: true, value: [] };
     return { ok: true, value: await discoverApplications(absPath) };
   }
   if (method === 'open') {
     const st = await statFile(ctx, params.path);
-    const absPath = st.ok ? st.value.absolutePath : resolveExistingCandidate(params.path, ctx.roots);
+    const absPath = st.ok ? st.value.absolutePath : resolveExistingCandidate(params.path, ctx);
     if (!absPath) return { ok: false, error: { code: 'invalid-path' } };
     const ok = await launchApplication(absPath, params.appId, shellApi);
     return ok ? { ok: true, value: { opened: true } } : { ok: false };
   }
   if (method === 'previewInBrowser') {
     const st = await statFile(ctx, params.path);
-    const absPath = st.ok ? st.value.absolutePath : resolveExistingCandidate(params.path, ctx.roots);
+    const absPath = st.ok ? st.value.absolutePath : resolveExistingCandidate(params.path, ctx);
     if (!absPath || isBlockedNetworkOrDevicePath(absPath) || !fs.existsSync(absPath)) {
       return { ok: false };
     }
@@ -208,7 +230,7 @@ export async function handleRpc(req, targetUrl = '', options = {}) {
   }
   if (method === 'reveal') {
     const st = await statFile(ctx, params.path);
-    const absPath = st.ok ? st.value.absolutePath : resolveExistingCandidate(params.path, ctx.roots);
+    const absPath = st.ok ? st.value.absolutePath : resolveExistingCandidate(params.path, ctx);
     if (!absPath) return { ok: false, error: { code: 'invalid-path' } };
     const ok = await revealInExplorer(absPath, shellApi);
     return ok ? { ok: true, value: { revealed: true } } : { ok: false };
@@ -242,15 +264,24 @@ function startSettingsWatcher() {
   } catch {}
 }
 
-async function attachTarget(target) {
+async function attachTarget(target, baseUrl) {
   const cdp = await cdpSession(target.webSocketDebuggerUrl);
   LIVE_SESSIONS.add(cdp);
   await cdp.call('Runtime.enable');
   await cdp.call('Runtime.evaluate', { expression: getBundle() });
+  const cidMatch = /\/c\/([^/?#]+)/.exec(target.url || '');
+  writeCdpStatus({
+    active: true,
+    stage: 'attached',
+    cdpUrl: baseUrl,
+    url: target.url || '',
+    conversationId: cidMatch ? decodeURIComponent(cidMatch[1]) : ''
+  });
   console.log(`[agy-file-actions] CDP attached: ${target.id} ${target.url}`);
 
   if (ONCE) {
     LIVE_SESSIONS.delete(cdp);
+    writeCdpStatus({ active: false, stage: 'once-detached', cdpUrl: baseUrl });
     cdp.close();
     return;
   }
@@ -287,6 +318,9 @@ async function attachTarget(target) {
   } finally {
     LIVE_SESSIONS.delete(cdp);
     ATTACHED.delete(target.id);
+    if (ATTACHED.size === 0) {
+      writeCdpStatus({ active: false, stage: 'idle', cdpUrl: baseUrl });
+    }
     cdp.close();
   }
 }
@@ -302,23 +336,48 @@ function isConversationTarget(target) {
 }
 
 async function scanOnce() {
-  const baseUrl = readDevtoolsAddress();
-  if (!baseUrl) return;
-  const listRes = await fetch(`${baseUrl}/json/list`, { signal: AbortSignal.timeout(2500) });
-  if (!listRes.ok) return;
-  const targets = (await listRes.json()).filter(isConversationTarget);
+  const addresses = readDevtoolsAddresses();
+  let baseUrl = '';
+  let targetList = null;
+  for (const candidate of addresses) {
+    try {
+      const listRes = await fetch(`${candidate}/json/list`, { signal: AbortSignal.timeout(1500) });
+      if (!listRes.ok) continue;
+      const parsed = await listRes.json();
+      if (Array.isArray(parsed)) {
+        baseUrl = candidate;
+        targetList = parsed;
+        break;
+      }
+    } catch {}
+  }
+  if (!baseUrl || !targetList) return;
+  const targets = targetList.filter(isConversationTarget);
   const liveIds = new Set(targets.map((t) => t.id));
   for (const id of ATTACHED.keys()) {
     if (!liveIds.has(id)) ATTACHED.delete(id);
   }
+  if (targets.length === 0 && ATTACHED.size === 0 && !ONCE) {
+    writeCdpStatus({ active: false, stage: 'waiting', cdpUrl: baseUrl });
+  }
   for (const target of targets) {
     if (ATTACHED.has(target.id)) continue;
     ATTACHED.set(target.id, true);
-    void attachTarget(target).catch(() => ATTACHED.delete(target.id));
+    void attachTarget(target, baseUrl).catch(() => ATTACHED.delete(target.id));
   }
 }
 
+function registerExitStatusReset() {
+  const onStop = () => {
+    writeCdpStatus({ active: false, stage: 'stopped' });
+  };
+  process.once('exit', onStop);
+  process.once('SIGINT', () => { onStop(); process.exit(0); });
+  process.once('SIGTERM', () => { onStop(); process.exit(0); });
+}
+
 async function main() {
+  registerExitStatusReset();
   if (ONCE) {
     await scanOnce();
     return;

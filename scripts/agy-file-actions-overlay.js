@@ -13,7 +13,7 @@
   'use strict';
 
   const VERSION = 'agy-file-actions-v1';
-  const BUILD = '20261126-3';
+  const BUILD = '20261127-1';
   const SETTINGS_KEY = 'dsh-file-actions.settings.v1';
   const PREF_APPS_KEY = 'dsh-file-actions.preferred-apps.v1';
   const APPS_CACHE_KEY = 'dsh-file-actions.apps.v1';
@@ -122,7 +122,11 @@
     queue: [],
     waiter: null,
     inflight: new Map(),
-    seq: 0
+    seq: 0,
+    hasSeenWaiter: false,
+    bridgeDown: false,
+    lastBackendSeenAt: 0,
+    lastOfflineNoticeAt: 0
   };
 
   function getConversationId() {
@@ -130,26 +134,82 @@
     return match ? decodeURIComponent(match[1]) : '';
   }
 
+  function showBridgeOfflineToast() {
+    const now = Date.now();
+    if (now - rpcState.lastOfflineNoticeAt < 8000 || !document.body) return;
+    rpcState.lastOfflineNoticeAt = now;
+    try {
+      const existing = document.getElementById('agy-fa-offline-toast');
+      if (existing) existing.remove();
+      const el = document.createElement('div');
+      el.id = 'agy-fa-offline-toast';
+      el.textContent = 'File Actions 后台未连通（请检查 DWrite.dll 或运行 CDP 注入脚本）';
+      el.style.cssText = 'position:fixed;right:18px;bottom:18px;z-index:2147483005;padding:8px 13px;border-radius:8px;font:12px/1.4 system-ui,"Microsoft YaHei",sans-serif;background:rgba(28,30,36,0.94);color:#f3f4f6;border:1px solid rgba(255,255,255,0.16);box-shadow:0 8px 24px rgba(0,0,0,0.35);pointer-events:none;';
+      document.body.appendChild(el);
+      setTimeout(() => { try { el.remove(); } catch {} }, 3200);
+    } catch {}
+  }
+
   function callBackend(method, params = {}, timeoutMs = 15000) {
+    if (rpcState.bridgeDown && rpcState.waiter === null) {
+      return Promise.reject(new Error(`RPC bridge disconnected: ${method}`));
+    }
     return new Promise((resolve, reject) => {
       const id = `r${++rpcState.seq}`;
-      const timer = setTimeout(() => {
-        if (rpcState.inflight.has(id)) {
-          rpcState.inflight.delete(id);
-          reject(new Error(`RPC timeout: ${method}`));
-        }
-      }, timeoutMs);
-      rpcState.inflight.set(id, {
-        resolve: (val) => { clearTimeout(timer); resolve(val); },
-        reject: (err) => { clearTimeout(timer); reject(err); }
-      });
-      rpcState.queue.push({
+      let settled = false;
+      const req = {
         id,
         method,
         params,
         conversationId: getConversationId(),
         pageUrl: location.href
+      };
+      const cleanupTimers = () => {
+        clearTimeout(timer);
+        clearTimeout(stallTimer);
+      };
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(stallTimer);
+        const qIdx = rpcState.queue.indexOf(req);
+        if (qIdx !== -1) rpcState.queue.splice(qIdx, 1);
+        if (rpcState.inflight.has(id)) {
+          rpcState.inflight.delete(id);
+          reject(new Error(`RPC timeout: ${method}`));
+        }
+      }, timeoutMs);
+
+      // Fail fast when queued requests are never picked up by Electron loader or CDP daemon
+      const stallMs = rpcState.hasSeenWaiter ? 2500 : 4500;
+      const stallTimer = setTimeout(() => {
+        if (settled || rpcState.waiter !== null) return;
+        const qIdx = rpcState.queue.indexOf(req);
+        if (qIdx === -1) return;
+        if (Date.now() - rpcState.lastBackendSeenAt < stallMs) return;
+        settled = true;
+        clearTimeout(timer);
+        rpcState.bridgeDown = true;
+        rpcState.queue.splice(qIdx, 1);
+        rpcState.inflight.delete(id);
+        reject(new Error(`RPC bridge disconnected: ${method}`));
+      }, Math.min(stallMs, timeoutMs));
+
+      rpcState.inflight.set(id, {
+        resolve: (val) => {
+          if (settled) return;
+          settled = true;
+          cleanupTimers();
+          resolve(val);
+        },
+        reject: (err) => {
+          if (settled) return;
+          settled = true;
+          cleanupTimers();
+          reject(err);
+        }
       });
+      rpcState.queue.push(req);
       if (rpcState.waiter) {
         const wake = rpcState.waiter;
         rpcState.waiter = null;
@@ -161,6 +221,9 @@
   function installBridgeInterface() {
     globalThis.__AGY_FA_BRIDGE__ = {
       waitRequest() {
+        rpcState.hasSeenWaiter = true;
+        rpcState.bridgeDown = false;
+        rpcState.lastBackendSeenAt = Date.now();
         if (rpcState.queue.length > 0) {
           return Promise.resolve(rpcState.queue.splice(0));
         }
@@ -178,6 +241,9 @@
         });
       },
       deliverResponse(id, ok, payload) {
+        rpcState.hasSeenWaiter = true;
+        rpcState.bridgeDown = false;
+        rpcState.lastBackendSeenAt = Date.now();
         const entry = rpcState.inflight.get(id);
         if (!entry) return;
         rpcState.inflight.delete(id);
@@ -185,6 +251,9 @@
         else entry.reject(new Error(typeof payload === 'string' ? payload : 'RPC failed'));
       },
       applyHostSettings(data) {
+        rpcState.hasSeenWaiter = true;
+        rpcState.bridgeDown = false;
+        rpcState.lastBackendSeenAt = Date.now();
         applySettingsToLocalStorage(data, true);
       }
     };
@@ -274,32 +343,81 @@
 
   /* ─────────────────────── AGY DOM Pre-Detection ─────────────────────── */
 
+  const WSL_HOSTS = new Set(['wsl.localhost', 'wsl$']);
+
+  function isValidWslDistro(distro) {
+    return Boolean(distro) && distro !== '.' && distro !== '..' && !/[<>:"/\\|?*\x00-\x1f]/.test(distro);
+  }
+
+  function isAllowedWslUnc(value) {
+    const m = /^(?:\\\\|\/\/)([^\\/]+)[\\/]([^\\/]+)(?:[\\/].*)?$/.exec(String(value || '').trim());
+    if (!m) return false;
+    return WSL_HOSTS.has(m[1].toLowerCase()) && isValidWslDistro(m[2].trim());
+  }
+
   function decodeFileUriWithHash(rawHref) {
     const value = String(rawHref || '').trim();
     if (!value) return '';
     try {
       let targetUrl;
+      let isWslRemote = false;
       if (/^file:\/\//i.test(value)) {
         targetUrl = new URL(value);
+      } else if (/^wsl:\/\//i.test(value)) {
+        targetUrl = new URL(value);
+        const distro = decodeURIComponent(targetUrl.hostname || '').trim();
+        if (!isValidWslDistro(distro)) return '';
+        const cleanPosix = decodeURIComponent(targetUrl.pathname || '/');
+        const normalizedPosix = cleanPosix.startsWith('/') ? cleanPosix : `/${cleanPosix}`;
+        const hash = /^#L\d+(?:-L?\d+)?$/i.test(String(targetUrl.hash || '')) ? targetUrl.hash : '';
+        return `//wsl.localhost/${distro}${normalizedPosix}${hash}`;
       } else if (/^(?:vscode-file|antigravity):\/\/file\//i.test(value)) {
         targetUrl = new URL(value.replace(/^(?:vscode-file|antigravity):\/\/file/i, 'file://'));
+      } else if (/^(?:vscode-remote|antigravity-remote):\/\//i.test(value)) {
+        targetUrl = new URL(value);
+        isWslRemote = true;
+      } else if (/^(?:vscode-file|antigravity):\/\/vscode-remote\//i.test(value)) {
+        targetUrl = new URL(value.replace(/^(?:vscode-file|antigravity):\/\/vscode-remote/i, 'vscode-remote://'));
+        isWslRemote = true;
       } else {
         return '';
       }
+
+      const hash = /^#L\d+(?:-L?\d+)?$/i.test(String(targetUrl.hash || '')) ? targetUrl.hash : '';
+
+      if (isWslRemote) {
+        let authority = '';
+        let posixPath = '/';
+        if (targetUrl.hostname) {
+          authority = decodeURIComponent(targetUrl.hostname);
+          posixPath = decodeURIComponent(targetUrl.pathname || '/');
+        } else {
+          const m = /^\/([^/]+)(\/.*)?$/.exec(targetUrl.pathname || '');
+          if (!m) return '';
+          authority = decodeURIComponent(m[1]);
+          posixPath = decodeURIComponent(m[2] || '/');
+        }
+        const wslMatch = /^wsl\+(.+)$/i.exec(authority);
+        if (!wslMatch || !isValidWslDistro(wslMatch[1].trim())) return '';
+        const cleanPosix = posixPath.startsWith('/') ? posixPath : `/${posixPath}`;
+        return `//wsl.localhost/${wslMatch[1].trim()}${cleanPosix}${hash}`;
+      }
+
       const host = String(targetUrl.hostname || '').toLowerCase();
       if (host && host !== 'localhost') {
-        return '';
+        if (!WSL_HOSTS.has(host)) return '';
+        const rawWsl = decodeURIComponent(targetUrl.pathname || '');
+        const wm = /^\/([^/]+)(\/.*)?$/.exec(rawWsl);
+        if (!wm || !isValidWslDistro(wm[1].trim())) return '';
+        return `//${host}${rawWsl}${hash}`;
       }
+
       let fsPath = decodeURIComponent(targetUrl.pathname || '');
       if (/^\/[A-Za-z]:/.test(fsPath)) {
         fsPath = fsPath.slice(1);
       }
       if (!fsPath) return '';
-      const hash = String(targetUrl.hash || '');
-      if (/^#L\d+(?:-L?\d+)?$/i.test(hash)) {
-        return `${fsPath}${hash}`;
-      }
-      return fsPath;
+      return `${fsPath}${hash}`;
     } catch {
       return '';
     }
@@ -312,9 +430,14 @@
       for (const key of ['path', 'file', 'filepath', 'uri', 'src']) {
         const val = parsed.searchParams.get(key);
         if (val) {
-          if (/^file:\/\//i.test(val)) return decodeFileUriWithHash(val);
+          if (/^(?:file|wsl|vscode-file|vscode-remote|antigravity|antigravity-remote):\/\//i.test(val)) {
+            return decodeFileUriWithHash(val);
+          }
           const trimmed = String(val).trim();
-          if (/^(?:[\\/]{2}|[\\/]\?[\\/]|[\\/]\.[\\/])/.test(trimmed)) return '';
+          if (/^(?:[\\/]\?[\\/]|[\\/]\.[\\/])/.test(trimmed)) return '';
+          if (/^[\\/]{2}/.test(trimmed)) {
+            return isAllowedWslUnc(trimmed) ? trimmed : '';
+          }
           if (/^(?:[A-Za-z]:[\\/]|\/(?![\\/]))/.test(trimmed)) return trimmed;
         }
       }
@@ -376,7 +499,9 @@
       for (const attr of ['data-path', 'data-file-path', 'data-filepath', 'data-uri']) {
         const val = dataHolder.getAttribute(attr);
         if (!val) continue;
-        const resolved = /^file:\/\//i.test(val) ? decodeFileUriWithHash(val) : val;
+        const resolved = /^(?:file|wsl|vscode-file|vscode-remote|antigravity|antigravity-remote):\/\//i.test(val)
+          ? decodeFileUriWithHash(val)
+          : val;
         if (resolved && looksLikePath(resolved)) {
           stampPath(dataHolder, resolved);
           return;
@@ -403,7 +528,9 @@
         for (const attr of ['title', 'aria-label', 'data-href', 'data-url']) {
           const raw = chip.getAttribute(attr);
           if (!raw) continue;
-          const fromUri = /^file:\/\//i.test(raw) ? decodeFileUriWithHash(raw) : '';
+          const fromUri = /^(?:file|wsl|vscode-file|vscode-remote|antigravity|antigravity-remote):\/\//i.test(raw)
+            ? decodeFileUriWithHash(raw)
+            : '';
           const candidate = fromUri || cleanChipText(raw, looksLikePath);
           if (candidate) {
             stampPath(chip, candidate);
@@ -988,7 +1115,8 @@
             try {
               const res = await callBackend('applications', { path }, 10000);
               return res || { ok: false, error: { code: 'failed' } };
-            } catch {
+            } catch (err) {
+              if (String(err?.message || '').includes('bridge disconnected')) showBridgeOfflineToast();
               return { ok: false, error: { code: 'failed' } };
             }
           },
@@ -997,7 +1125,8 @@
               const method = req?.action === 'reveal' ? 'reveal' : 'open';
               const res = await callBackend(method, { path: req?.path, appId: req?.application }, 10000);
               return res || { ok: false };
-            } catch {
+            } catch (err) {
+              if (String(err?.message || '').includes('bridge disconnected')) showBridgeOfflineToast();
               return { ok: false };
             }
           }

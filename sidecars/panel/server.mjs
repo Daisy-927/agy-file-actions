@@ -5,11 +5,12 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  STATUS_FILE,
+  detectRuntimeLoaderStatus,
   isBlockedNetworkOrDevicePath,
   launchApplication,
   listRecentFiles,
   loadSettings,
+  parseWslUncPath,
   resolveConversationContext,
   revealInExplorer,
   saveSettings
@@ -88,13 +89,18 @@ function hasValidToken(req) {
   }
 }
 
-function readLoaderStatus() {
+async function readLoaderStatus() {
+  return detectRuntimeLoaderStatus();
+}
+
+function resolveRealPathSafe(targetPath) {
   try {
-    if (!fs.existsSync(STATUS_FILE)) return { active: false };
-    const parsed = JSON.parse(fs.readFileSync(STATUS_FILE, 'utf8'));
-    return parsed && typeof parsed === 'object' ? parsed : { active: false };
-  } catch {
-    return { active: false };
+    return fs.realpathSync.native(targetPath);
+  } catch (err) {
+    if (parseWslUncPath(targetPath)) {
+      return fs.realpathSync(targetPath);
+    }
+    throw err;
   }
 }
 
@@ -102,7 +108,7 @@ function isInsideAnyRoot(absPath, roots) {
   if (!absPath || isBlockedNetworkOrDevicePath(absPath)) return false;
   let realTarget;
   try {
-    realTarget = fs.realpathSync.native(absPath);
+    realTarget = resolveRealPathSafe(absPath);
     if (!fs.statSync(realTarget).isFile()) return false;
   } catch {
     return false;
@@ -110,7 +116,7 @@ function isInsideAnyRoot(absPath, roots) {
   const normTarget = process.platform === 'win32' ? realTarget.toLowerCase() : realTarget;
   return (roots || []).some((root) => {
     try {
-      const realRoot = fs.realpathSync.native(root).replace(/[\\/]+$/, '');
+      const realRoot = resolveRealPathSafe(root).replace(/[\\/]+$/, '');
       const normRoot = process.platform === 'win32' ? realRoot.toLowerCase() : realRoot;
       return normTarget === normRoot || normTarget.startsWith(`${normRoot}${path.sep}`);
     } catch {
@@ -176,7 +182,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === '/api/health') {
-      sendJson(res, 200, { ok: true, pid: process.pid, loader: readLoaderStatus() });
+      sendJson(res, 200, { ok: true, pid: process.pid, loader: await readLoaderStatus() });
       return;
     }
 
@@ -185,14 +191,14 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 403, { ok: false, error: 'Invalid or missing token' });
         return;
       }
-      const loader = readLoaderStatus();
+      const loader = await readLoaderStatus();
       const cid = url.searchParams.get('conversationId') || loader.conversationId || process.env.ANTIGRAVITY_CONVERSATION_ID || '';
       const ctx = resolveConversationContext(cid, loader.url || '');
       const recentFiles = await listRecentFiles(ctx, 25);
       sendJson(res, 200, {
         ok: true,
         loader,
-        session: { id: ctx.id, cwd: ctx.cwd, roots: ctx.roots, brainDir: ctx.brainDir, outsideProject: ctx.outsideProject },
+        session: { id: ctx.id, cwd: ctx.cwd, roots: ctx.roots, brainDir: ctx.brainDir, outsideProject: ctx.outsideProject, wsl: ctx.wsl },
         settings: loadSettings(),
         recentFiles
       });
@@ -227,7 +233,7 @@ const server = http.createServer(async (req, res) => {
       }
       const body = await readJsonBody(req);
       const absPath = String(body?.path || '');
-      const loader = readLoaderStatus();
+      const loader = await readLoaderStatus();
       const cid = loader.conversationId || process.env.ANTIGRAVITY_CONVERSATION_ID || '';
       const ctx = resolveConversationContext(cid, loader.url || '');
       if (!absPath || !fs.existsSync(absPath) || !isInsideAnyRoot(absPath, ctx.roots)) {

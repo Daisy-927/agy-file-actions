@@ -571,7 +571,7 @@ test('Sidecar server enforces CSRF token on GET/POST, CSP headers, symlink root 
   fs.symlinkSync(outsideDir, junctionDir, 'junction');
   fs.writeFileSync(
     path.join(statusDir, 'direct_loader_status.json'),
-    JSON.stringify({ active: true, conversationId: cid, url: `https://127.0.0.1:7255/c/${cid}` }),
+    JSON.stringify({ active: true, pid: process.pid, stage: 'attached', conversationId: cid, url: `https://127.0.0.1:7255/c/${cid}` }),
     'utf8'
   );
 
@@ -764,4 +764,153 @@ test('install.ps1 uses ConvertTo-Json to safely quote loader paths containing ap
   assert.match(ps1, /ConvertTo-Json\s+-InputObject\s+\$LoaderJsPath\s+-Compress/);
   assert.match(ps1, /const _agyFileActionsLoader = \$LoaderJsPathJson;/);
   assert.doesNotMatch(ps1, /const _agyFileActionsLoader = '\$LoaderJsPath';/);
+});
+
+test('Sidecar marks dead-PID direct_loader_status.json as inactive stale', async () => {
+  const tmpAppData = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fa-stale-'));
+  const statusDir = path.join(tmpAppData, 'plugin_data', 'agy-file-actions');
+  fs.mkdirSync(statusDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(statusDir, 'direct_loader_status.json'),
+    JSON.stringify({ active: true, pid: 99999999, stage: 'attached' }),
+    'utf8'
+  );
+  const sidecarPort = 29932 + Math.floor(Math.random() * 1000);
+  const proc = spawn(process.execPath, ['--no-warnings', path.join(ROOT, 'sidecars', 'panel', 'server.mjs')], {
+    env: {
+      ...process.env,
+      ANTIGRAVITY_SIDECAR_WEB_PORT: String(sidecarPort),
+      ANTIGRAVITY_APP_DATA_DIR: tmpAppData
+    },
+    stdio: 'ignore',
+    windowsHide: true
+  });
+  try {
+    const base = `http://127.0.0.1:${sidecarPort}`;
+    const health = await pollUntil(async () => {
+      const r = await fetch(`${base}/api/health`);
+      return r.ok ? r.json() : null;
+    });
+    assert.equal(health.ok, true);
+    assert.equal(health.loader.active, false);
+    assert.equal(health.loader.stale, true);
+  } finally {
+    try { proc.kill(); } catch {}
+    fs.rmSync(tmpAppData, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
+  }
+});
+
+test('frontend overlay allows WSL URIs/UNC media while blocking remote SMB URIs, and fails fast when backend pump stops', { skip: !fs.existsSync(EDGE_PATH) }, async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fa-wsl-e2e-'));
+  const userDataDir = path.join(tmp, 'edge-profile');
+  fs.mkdirSync(userDataDir, { recursive: true });
+  const cid = '22222222-3333-4444-5555-666666666666';
+  const server = http.createServer((req, res) => {
+    const u = new URL(req.url || '/', 'http://127.0.0.1');
+    if (u.pathname === `/c/${cid}`) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!doctype html><html><body>
+        <a id="wsl-file" href="file://wsl.localhost/Ubuntu/home/alice/app.ts#L10">wsl file</a>
+        <a id="wsl-remote" href="vscode-file://vscode-remote/wsl+Ubuntu/home/alice/mod.ts#L2-L4">wsl remote</a>
+        <a id="evil-unc" href="file://evil/share/secret.txt">evil</a>
+        <img id="wsl-img" src="http://127.0.0.1/api/file?path=%5C%5Cwsl.localhost%5CUbuntu%5Chome%5Ca.png" />
+        <img id="evil-img" src="http://127.0.0.1/api/file?path=%5C%5Cevil%5Cshare%5Ca.png" />
+      </body></html>`);
+      return;
+    }
+    res.writeHead(404); res.end();
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+  let edgeProc;
+  let cdp;
+  try {
+    edgeProc = spawn(EDGE_PATH, [
+      '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
+      '--remote-debugging-port=0', `--user-data-dir=${userDataDir}`, `http://127.0.0.1:${port}/c/${cid}`
+    ], { stdio: ['ignore', 'ignore', 'pipe'] });
+    const wsBase = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Edge timeout')), 10000);
+      let buf = '';
+      edgeProc.stderr.on('data', (c) => {
+        buf += c.toString('utf8');
+        const m = /DevTools listening on (ws:\/\/[^\s]+)/.exec(buf);
+        if (m) { clearTimeout(timer); resolve(m[1]); }
+      });
+    });
+    const targets = await pollUntil(async () => {
+      const list = await (await fetch(`http://127.0.0.1:${new URL(wsBase).port}/json/list`)).json();
+      return list.find((t) => t.type === 'page' && t.url.includes(`/c/${cid}`));
+    });
+    cdp = await cdpClient(targets.webSocketDebuggerUrl);
+    await cdp.call('Runtime.enable');
+    await pollUntil(async () => {
+      const r = await cdp.call('Runtime.evaluate', {
+        expression: `document.readyState === 'complete' && Boolean(document.querySelector('#wsl-file'))`,
+        returnByValue: true
+      });
+      return r.result?.value;
+    });
+    const vendorSrc = fs.readFileSync(path.join(ROOT, 'vendor', 'dsh-file-actions-client.js'), 'utf8');
+    const overlaySrc = fs.readFileSync(path.join(ROOT, 'scripts', 'agy-file-actions-overlay.js'), 'utf8');
+    await cdp.call('Runtime.evaluate', {
+      expression: `(() => { const p = window.__ModuleLoader__; window.__ModuleLoader__ = { load(d){ globalThis.__AGY_DSH_FILE_ACTIONS_FACTORY__ = d.factory; } }; try { ${vendorSrc} } finally { window.__ModuleLoader__ = p; } })(); ${overlaySrc}`
+    });
+    await pollUntil(async () => (await cdp.call('Runtime.evaluate', { expression: `document.documentElement.getAttribute('data-dfa-ready') === '1'`, returnByValue: true })).result?.value);
+
+    // 1. Verify WSL DOM carrier stamping while blocking foreign SMB URIs
+    // 2. Drain initial bootstrap RPCs once so bridge enters "hasSeenWaiter", then leave pump offline and verify queued requests fail fast (< 4s)
+    const evalOut = await cdp.call('Runtime.evaluate', {
+      awaitPromise: true,
+      returnByValue: true,
+      expression: `(async () => {
+        const initBatch = await globalThis.__AGY_FA_BRIDGE__.waitRequest();
+        for (const req of initBatch) {
+          globalThis.__AGY_FA_BRIDGE__.deliverResponse(req.id, true, req.method === 'getSettings' ? { clientSettings: { menuMode: 'full', contextLines: 8, glass: 'on' }, preferredApps: {} } : {});
+        }
+        await new Promise((r) => setTimeout(r, 30));
+
+        for (const id of ['#wsl-file', '#wsl-remote', '#evil-unc', '#wsl-img', '#evil-img']) {
+          document.querySelector(id).dispatchEvent(new MouseEvent('pointerover', { bubbles: true }));
+        }
+        const stamps = {
+          wslFile: document.querySelector('#wsl-file').getAttribute('data-file-actions-path'),
+          wslRemote: document.querySelector('#wsl-remote').getAttribute('data-file-actions-path'),
+          evilUnc: document.querySelector('#evil-unc').getAttribute('data-file-actions-path'),
+          wslImg: document.querySelector('#wsl-img').getAttribute('data-file-actions-path'),
+          evilImg: document.querySelector('#evil-img').getAttribute('data-file-actions-path'),
+        };
+
+        document.querySelector('#wsl-file').dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2, clientX: 40, clientY: 40 }));
+        // Wait 2.9s without polling waitRequest -> stallTimer (2500ms) must evict the stalled queued RPCs
+        await new Promise((r) => setTimeout(r, 2900));
+        const lateDrain = await Promise.race([
+          globalThis.__AGY_FA_BRIDGE__.waitRequest().then((batch) => batch.length),
+          new Promise((r) => setTimeout(() => r('idle'), 300))
+        ]);
+        const menuVisible = Boolean(document.querySelector('[data-dfa-menu="1"]'));
+        return { stamps, initCount: initBatch.length, lateDrain, menuVisible };
+      })()`
+    });
+    const out = evalOut.result?.value;
+    assert.equal(out.stamps.wslFile, '//wsl.localhost/Ubuntu/home/alice/app.ts#L10');
+    assert.equal(out.stamps.wslRemote, '//wsl.localhost/Ubuntu/home/alice/mod.ts#L2-L4');
+    assert.equal(out.stamps.evilUnc, null);
+    assert.equal(out.stamps.wslImg, '\\\\wsl.localhost\\Ubuntu\\home\\a.png');
+    assert.equal(out.stamps.evilImg, null);
+    assert.ok(out.initCount >= 1);
+    assert.equal(out.menuVisible, true);
+    assert.equal(out.lateDrain, 'idle', `Expected stalled RPCs to fail fast and evict queue, got ${out.lateDrain}`);
+  } finally {
+    try { cdp?.close(); } catch {}
+    if (edgeProc?.pid) {
+      await new Promise((resolve) => {
+        const killer = spawn('taskkill.exe', ['/PID', String(edgeProc.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+        killer.on('exit', resolve);
+        killer.on('error', resolve);
+      });
+    }
+    try { server.close(); } catch {}
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
+  }
 });

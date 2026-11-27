@@ -2,6 +2,21 @@
 
 All notable changes to `agy-file-actions` are documented in this file.
 
+## [0.1.4] - 2026-11-27
+
+> Thanks to [@NanFamega](https://github.com/NanFamega) for the detailed WSL2 / no-`DWrite.dll` diagnosis and suggestions in [#1](https://github.com/Daisy-927/agy-file-actions/issues/1)!
+
+### Added
+- **WSL2 remote development support (`scripts/windows-file-ops.mjs`, `scripts/agy-file-actions-overlay.js`, `sidecars/panel/server.mjs`)**:
+  - Safely allowlisted local WSL 9P UNC paths (`\\wsl.localhost\<distro>\...`, `\\wsl$\<distro>\...`) and WSL URIs (`file://wsl.localhost/...`, `file://wsl$/...`, `wsl://...`, `vscode-remote://wsl+...`, `vscode-file://vscode-remote/wsl+...`, `antigravity://vscode-remote/wsl+...`) while keeping all other network SMB UNC paths, extended/device paths (`\\?\`, `\\.\`), spoofed hostnames, and share-escaping traversals blocked.
+  - Added Linux POSIX path mapping in active WSL sessions so `/home/...`, `file:///home/...`, and `~/...` resolve to the active (or default Windows/env `AGY_WSL_DISTRO`) distro UNC mount and `/mnt/<drive>/...` maps cleanly to `<DRIVE>:\...` (and falls back cleanly on WSL 9P paths in Sidecar root containment checks).
+- **Zero-host-Node CDP launcher (`scripts/run-cdp.ps1`)**: Prefers host Node.js `>= 22`, supports `-CdpUrl` override, and falls back to `Antigravity.exe` with `ELECTRON_RUN_AS_NODE=1` when Windows host `node` is not installed (e.g. WSL-only Node setups).
+
+### Fixed
+- **Accurate runtime status detection & CDP probing (`scripts/windows-file-ops.mjs`, `scripts/electron-overlay-loader.cjs`, `scripts/runtime-injector.mjs`, `sidecars/panel/server.mjs`, `sidecars/panel/ui.html`)**:
+  - Replaced static `direct_loader_status.json` file checks with live PID liveness verification (`process.kill(pid, 0)`), clean `will-quit` status reset, `cdp_loader_status.json` tracking (including `waiting` state before a conversation tab opens), and prioritized local CDP `/json/list` probing (`AGY_CDP_URL` -> `DevToolsActivePort` -> stale status URL -> `127.0.0.1:9222` fallback) so stale files left after missing `DWrite.dll` or port changes no longer misreport status.
+- **Fast-fail disconnected RPC bridge (`scripts/agy-file-actions-overlay.js`)**: Fail un-dequeued RPC requests in ~2.5–4.5s with a non-blocking offline notice on click actions instead of silently stalling for 10–15s when the host pump or CDP daemon is disconnected.
+
 ## [0.1.3] - 2026-11-26
 
 ### Added

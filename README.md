@@ -12,8 +12,8 @@
 
 ## 适用环境与前提条件
 
-- **仅支持 Windows（Windows Only）**：目前注册表关联应用查询（`reg.exe`）、资源管理器定位（`explorer.exe` / `shell.showItemInFolder`）及安装脚本均仅针对 Windows 10/11 实现，**暂不支持 macOS 与 Linux**。
-- **Node.js**：`>= 22.0.0`（依赖内置 `node:sqlite` 与原生 `WebSocket`）。
+- **仅支持 Windows 宿主机（支持 WSL2 远程工作区）**：注册表关联应用查询（`reg.exe`）、资源管理器定位（`explorer.exe` / `shell.showItemInFolder`）与安装脚本运行在 Windows 10/11 宿主机上（暂不支持 macOS / Linux 宿主机），但已支持 **WSL2 远程开发工作区**（`\\wsl.localhost\` / `\\wsl$\` 与 `/home/...` 路径自动映射）。
+- **Node.js**：`>= 22.0.0`（依赖内置 `node:sqlite` 与原生 `WebSocket`）。Sidecar 右侧边栏面板依赖 Windows 宿主机 `node`；如果未在 Windows 安装 Node 而只想启用聊天区右键菜单，方式二 CDP 模式提供的 `scripts/run-cdp.ps1` 会尝试自动借用 `Antigravity.exe` 内置运行时（或在 Windows 宿主机安装 Node.js 22+ 以同时启用 Sidecar 面板）。
 - **PowerShell 7 (`pwsh`)**：用于运行 [install.ps1](install.ps1)（不建议使用老旧 Windows PowerShell 5.1）。
 - **已验证宿主版本与兼容性声明**：已在 Windows 桌面端 **Google Antigravity `2.34.0` – `2.35.1`**（安装目录 `version` 标识 `44.9.1`）下实测适配；不保证兼容未来的所有 AGY 大版本——如后续官方大版本调整聊天区 DOM 结构、Sidecar 注册机制或 Electron 启动逻辑，部分识别规则或引导方式可能需要同步更新。
 
@@ -76,11 +76,17 @@ pwsh ./install.ps1 -Uninstall
 # 1. 带远程调试端口启动 Antigravity（请仅在受信任的本机单用户环境下启用调试端口）
 & "Antigravity.exe" --remote-debugging-port=9222
 
-# 2. 在仓库目录启动 CDP 注入守护进程（自动发现本地 DevToolsActivePort）
+# 2. 启动 CDP 注入守护进程（自动发现本地 DevToolsActivePort 或默认 9222；若未在 Windows 安装 Node，会自动尝试借用 Antigravity.exe）
+pwsh ./scripts/run-cdp.ps1
+
+# 如使用了自定义调试端口，可通过 -CdpUrl 指定：
+pwsh ./scripts/run-cdp.ps1 -CdpUrl http://127.0.0.1:9222
+
+# 如已有宿主机 Node.js >= 22，也可直接运行：
 node --no-warnings ./scripts/runtime-injector.mjs
 ```
 
-*(注：仍建议同时将本插件目录放入 `~/.gemini/config/plugins/agy-file-actions` 以启用 Sidecar 侧栏设置面板。)*
+*(注：仍建议同时将本插件目录放入 `~/.gemini/config/plugins/agy-file-actions` 以启用 Sidecar 侧栏设置面板；Sidecar 面板依赖 Windows 宿主机 Node.js `>= 22`，并会实时校验 Electron 进程与 CDP 端口存活状态。)*
 
 ---
 
@@ -111,7 +117,8 @@ node --no-warnings ./scripts/runtime-injector.mjs
 
 - **右键没有反应？**
   1. 确认安装或更新后已**完全退出** Antigravity 托盘进程再重启。
-  2. 检查 `~/.gemini/antigravity/plugin_data/agy-file-actions/direct_loader_status.json` 是否存在且包含 `"stage": "attached"`；若无此文件，说明 `resources/app/index.cjs` 未被启动（通常是安装目录缺少 `DWrite.dll`，请确认引导环境或改用方式二 CDP 模式）。
+  2. 打开右侧边栏「File Actions」面板查看实时运行状态（支持实时校验 Electron 进程存活、CDP 端口连通与注入守护状态）；若显示「未激活（需 DWrite.dll 或 CDP）」或「调试端口已开，未运行 CDP 注入」，请确认安装目录存在 `DWrite.dll`，或改用方式二 CDP 模式并运行 `pwsh ./scripts/run-cdp.ps1`（可选 `-CdpUrl http://127.0.0.1:9222`）。
+  3. 在 WSL2 远程会话中如果工作区未附带发行版名称，可通过环境变量 `AGY_WSL_DISTRO` 指定默认发行版（未设置时会自动读取 Windows 默认 WSL 发行版）。
 - **侧边栏「插件」里看不到 `File Actions`？**
   - Antigravity 插件扫描器会跳过 NTFS Junction / 符号链接。请确认 `~/.gemini/config/plugins/agy-file-actions` 是**实体目录**且包含 `plugin.json` 与 `sidecars/panel/sidecar.json`（使用最新版 `install.ps1` 安装会自动处理），并重启一次 Antigravity 刷新插件列表。
 - **为什么安装了其他插件后 `File Actions` 失效了？**
@@ -126,8 +133,8 @@ node --no-warnings ./scripts/runtime-injector.mjs
 - `scripts/windows-file-ops.mjs`：Windows 文件定位、`conversation_summaries.db` 工作区与 `brain/` 目录解析、分块读取、`reg.exe` 关联应用与图标查询
 - `scripts/electron-overlay-loader.cjs`：Electron 主进程加载器
 - `scripts/preview-server.mjs`：本地沙盒 HTML / SVG / 媒体预览 HTTP 服务（Electron 与 CDP 模式共用）
-- `scripts/runtime-injector.mjs`：CDP 模式注入脚本
-- `sidecars/panel/`：Antigravity Sidecar 设置与近期文件面板
+- `scripts/runtime-injector.mjs` & `scripts/run-cdp.ps1`：CDP 模式注入守护与无宿主机 Node 回退启动脚本
+- `sidecars/panel/`：Antigravity Sidecar 设置、实时运行状态检测与近期文件面板
 - `test/`：单元测试与无头 Edge E2E 测试
 
 ## 运行测试

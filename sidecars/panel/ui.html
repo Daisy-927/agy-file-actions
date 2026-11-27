@@ -73,6 +73,7 @@
     }
     .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); }
     .dot.ok { background: var(--ok); }
+    .dot.err { background: #f85149; }
     .card {
       background: var(--card);
       border: 1px solid var(--border);
@@ -349,9 +350,26 @@
           $('status-text').textContent = '状态获取失败';
           return;
         }
-        const active = Boolean(data.loader?.active);
-        $('status-dot').classList.toggle('ok', active);
-        $('status-text').textContent = active ? '注入已激活' : '未注入（需运行 install.ps1）';
+        const loader = data.loader || {};
+        const active = Boolean(loader.active);
+        const dotEl = $('status-dot');
+        dotEl.classList.toggle('ok', active && (loader.stage === 'attached' || (loader.mode === 'cdp' && loader.stage !== 'waiting')));
+        dotEl.classList.toggle('err', !active && !loader.cdpReady);
+        if (active && loader.mode === 'cdp' && loader.stage === 'waiting') {
+          $('status-text').textContent = 'CDP 守护运行中（待打开对话）';
+        } else if (active && loader.mode === 'cdp') {
+          $('status-text').textContent = 'CDP 注入已激活';
+        } else if (active && loader.stage === 'loaded') {
+          $('status-text').textContent = '引导已加载（待打开对话）';
+        } else if (active) {
+          $('status-text').textContent = 'Electron 直连已激活';
+        } else if (loader.mode === 'cdp-unattached' || loader.cdpReady) {
+          $('status-text').textContent = '调试端口已开，未运行 CDP 注入';
+        } else if (loader.stale) {
+          $('status-text').textContent = '未激活（上次进程已退出）';
+        } else {
+          $('status-text').textContent = '未激活（需 DWrite.dll 或 CDP）';
+        }
         $('cwd-label').textContent = '工作区：' + (data.session?.cwd || '未关联');
         if (data.settings) {
           currentSettings = data.settings;

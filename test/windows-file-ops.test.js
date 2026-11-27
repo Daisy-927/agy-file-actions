@@ -5,17 +5,23 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import http from 'node:http';
 import {
   buildSpawnArgs,
+  detectRuntimeLoaderStatus,
   discoverApplications,
   expandWinEnv,
   isAbsoluteFsPath,
   isBlockedNetworkOrDevicePath,
+  isPidAlive,
   launchApplication,
   listDir,
   listRecentFiles,
   parseCommandTemplate,
   parseRegOutput,
+  parseWorkspaceUris,
+  parseWslUncPath,
+  parseWslUri,
   readFileBytes,
   resolveCandidatePaths,
   resolveConversationContext,
@@ -178,4 +184,193 @@ test('buildSpawnArgs preserves literal $ sequences in Windows file paths', () =>
   const weirdPath = 'C:\\work\\price$$1$&test$\'file.txt';
   assert.deepEqual(buildSpawnArgs('"--open=%1"', weirdPath), [`--open=${weirdPath}`]);
   assert.deepEqual(buildSpawnArgs('%1', weirdPath), [weirdPath]);
+});
+
+test('allowlists valid WSL UNC paths & URIs while keeping remote SMB UNC and traversal escapes blocked', () => {
+  assert.equal(isBlockedNetworkOrDevicePath('\\\\wsl.localhost\\Ubuntu\\home\\alice\\app.ts'), false);
+  assert.equal(isBlockedNetworkOrDevicePath('//wsl.localhost/Ubuntu/home/alice/app.ts'), false);
+  assert.equal(isBlockedNetworkOrDevicePath('\\\\wsl$\\Ubuntu-22.04\\etc\\hosts'), false);
+  assert.equal(isBlockedNetworkOrDevicePath('file://wsl.localhost/Ubuntu/home/alice/app.ts'), false);
+  assert.equal(isBlockedNetworkOrDevicePath('file://wsl$/Ubuntu/home/alice/app.ts'), false);
+  assert.equal(isBlockedNetworkOrDevicePath('vscode-remote://wsl+Ubuntu/home/alice/proj'), false);
+  assert.equal(isBlockedNetworkOrDevicePath('vscode-file://vscode-remote/wsl+Ubuntu/home/alice/app.ts#L5'), false);
+
+  // Spoofed/generic UNC, bare distro traversal, and non-WSL remote hosts stay blocked
+  assert.equal(isBlockedNetworkOrDevicePath('\\\\wsl.localhost.evil.com\\share\\a.txt'), true);
+  assert.equal(isBlockedNetworkOrDevicePath('\\\\wsl.localhost\\..\\c$\\Windows\\win.ini'), true);
+  assert.equal(isBlockedNetworkOrDevicePath('\\\\wsl.localhost'), true);
+  assert.equal(isBlockedNetworkOrDevicePath('file://wsl.localhost.evil/Ubuntu/a.txt'), true);
+  assert.equal(isBlockedNetworkOrDevicePath('\\\\127.0.0.1\\c$\\Windows\\win.ini'), true);
+
+  assert.equal(isAbsoluteFsPath('\\\\wsl.localhost\\Ubuntu\\home\\alice\\app.ts'), true);
+  assert.equal(isAbsoluteFsPath('vscode-remote://wsl+Ubuntu/home/alice/proj'), true);
+
+  // Traversal must clamp cleanly inside the distro instead of escaping to another share
+  const clamped = parseWslUncPath('\\\\wsl.localhost\\Ubuntu\\home\\..\\..\\other\\file.txt');
+  assert.equal(clamped?.distro, 'Ubuntu');
+  assert.equal(clamped?.winPath, '\\\\wsl.localhost\\Ubuntu\\other\\file.txt');
+
+  const parsedRemote = parseWslUri('vscode-file://vscode-remote/wsl%2BUbuntu-22.04/home/alice/app.ts#L12');
+  assert.equal(parsedRemote?.distro, 'Ubuntu-22.04');
+  assert.equal(parsedRemote?.winPath, '\\\\wsl.localhost\\Ubuntu-22.04\\home\\alice\\app.ts');
+  assert.equal(parsedRemote?.hash, '#L12');
+});
+
+test('maps WSL remote workspaces, /home/... paths, /mnt/<drive>/..., and clamped relative paths', () => {
+  const mappedUris = parseWorkspaceUris(['vscode-remote://wsl+Ubuntu/home/alice/repo'], { existsSync: () => false });
+  assert.equal(mappedUris[0], '\\\\wsl.localhost\\Ubuntu\\home\\alice\\repo');
+
+  const mappedDollar = parseWorkspaceUris(
+    ['vscode-remote://wsl+Ubuntu-20.04/home/alice/repo'],
+    { existsSync: (p) => p.startsWith('\\\\wsl$\\') }
+  );
+  assert.equal(mappedDollar[0], '\\\\wsl$\\Ubuntu-20.04\\home\\alice\\repo');
+
+  const wslCtx = {
+    id: 'wsl-cid',
+    cwd: '\\\\wsl.localhost\\Ubuntu\\home\\alice\\repo',
+    roots: ['\\\\wsl.localhost\\Ubuntu\\home\\alice\\repo'],
+    wsl: { host: 'wsl.localhost', distro: 'Ubuntu', mountRoot: '\\\\wsl.localhost\\Ubuntu' }
+  };
+
+  const homeCandidates = resolveCandidatePaths('/home/alice/repo/src/index.ts', wslCtx.roots, wslCtx);
+  assert.equal(homeCandidates[0], '\\\\wsl.localhost\\Ubuntu\\home\\alice\\repo\\src\\index.ts');
+
+  const mntCandidates = resolveCandidatePaths('/mnt/e/work/notes.md', wslCtx.roots, wslCtx);
+  assert.equal(mntCandidates[0], 'E:\\work\\notes.md');
+  assert.ok(mntCandidates.includes('\\\\wsl.localhost\\Ubuntu\\mnt\\e\\work\\notes.md'));
+
+  const clampedRel = resolveCandidatePaths('..\\..\\..\\etc\\passwd', wslCtx.roots, wslCtx);
+  assert.equal(clampedRel[0], '\\\\wsl.localhost\\Ubuntu\\etc\\passwd');
+
+  // POSIX file:///home/... and ~/... in active WSL session
+  const filePosixCandidates = resolveCandidatePaths('file:///home/alice/repo/src/index.ts', wslCtx.roots, wslCtx);
+  assert.equal(filePosixCandidates[0], '\\\\wsl.localhost\\Ubuntu\\home\\alice\\repo\\src\\index.ts');
+
+  const tildeCandidates = resolveCandidatePaths('~/notes.md', wslCtx.roots, wslCtx);
+  assert.equal(tildeCandidates[0], '\\\\wsl.localhost\\Ubuntu\\home\\alice\\notes.md');
+  assert.ok(tildeCandidates.includes(path.join(os.homedir(), 'notes.md')));
+
+  // wsl:// URI, plain POSIX workspace URI, and /mnt/<drive> workspace URI with default distro fallback
+  assert.equal(isBlockedNetworkOrDevicePath('wsl://Ubuntu/home/alice/app.ts'), false);
+  const wslSchemeUris = parseWorkspaceUris(
+    ['wsl://Ubuntu/home/alice/repo', 'file:///home/alice/proj', '/home/alice/other', 'file:///mnt/d/work'],
+    { defaultWslDistro: 'Ubuntu', existsSync: () => false }
+  );
+  assert.equal(wslSchemeUris[0], '\\\\wsl.localhost\\Ubuntu\\home\\alice\\repo');
+  assert.equal(wslSchemeUris[1], '\\\\wsl.localhost\\Ubuntu\\home\\alice\\proj');
+  assert.equal(wslSchemeUris[2], '\\\\wsl.localhost\\Ubuntu\\home\\alice\\other');
+  assert.equal(wslSchemeUris[3], 'D:\\work');
+});
+
+test('detectRuntimeLoaderStatus validates PID liveness and live CDP reachability accurately', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fa-status-'));
+  const directFile = path.join(tmp, 'direct_loader_status.json');
+  const cdpFile = path.join(tmp, 'cdp_loader_status.json');
+  const portFile = path.join(tmp, 'DevToolsActivePort');
+
+  let cdpServer;
+  try {
+    assert.equal(isPidAlive(process.pid), true);
+
+    // 1. Stale direct_loader_status.json from an exited process must NOT report active
+    fs.writeFileSync(directFile, JSON.stringify({ active: true, pid: 99999999, stage: 'attached' }), 'utf8');
+    const staleStatus = await detectRuntimeLoaderStatus({
+      statusFile: directFile,
+      cdpStatusFile: cdpFile,
+      portFiles: [portFile],
+      isPidAlive: () => false
+    });
+    assert.equal(staleStatus.active, false);
+    assert.equal(staleStatus.stale, true);
+    assert.equal(staleStatus.reason, 'process-exited');
+
+    // 2. Live Electron process reports active
+    const liveElectron = await detectRuntimeLoaderStatus({
+      statusFile: directFile,
+      cdpStatusFile: cdpFile,
+      portFiles: [portFile],
+      isPidAlive: (pid) => pid === 99999999
+    });
+    assert.equal(liveElectron.active, true);
+    assert.equal(liveElectron.mode, 'electron');
+
+    // 3. Stale Electron + reachable CDP port without injector -> cdp-unattached
+    cdpServer = http.createServer((req, res) => {
+      if (req.url === '/json/list') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([{ id: 't1', type: 'page', url: 'https://127.0.0.1:7255/c/abc' }]));
+        return;
+      }
+      res.writeHead(404); res.end();
+    });
+    await new Promise((r) => cdpServer.listen(0, '127.0.0.1', r));
+    const port = cdpServer.address().port;
+    fs.writeFileSync(portFile, `${port}\n/devtools/browser/test\n`, 'utf8');
+
+    const unattached = await detectRuntimeLoaderStatus({
+      statusFile: directFile,
+      cdpStatusFile: cdpFile,
+      portFiles: [portFile],
+      isPidAlive: () => false
+    });
+    assert.equal(unattached.active, false);
+    assert.equal(unattached.mode, 'cdp-unattached');
+    assert.equal(unattached.cdpReady, true);
+    assert.equal(unattached.cdpPort, port);
+
+    // 4. Live CDP injector PID + reachable CDP endpoint -> active CDP
+    fs.writeFileSync(cdpFile, JSON.stringify({ active: true, pid: process.pid, cdpUrl: `http://127.0.0.1:${port}`, stage: 'attached' }), 'utf8');
+    const cdpLive = await detectRuntimeLoaderStatus({
+      statusFile: directFile,
+      cdpStatusFile: cdpFile,
+      portFiles: [portFile],
+      isPidAlive: (pid) => pid === process.pid
+    });
+    assert.equal(cdpLive.active, true);
+    assert.equal(cdpLive.mode, 'cdp');
+    assert.equal(cdpLive.cdpPort, port);
+
+    // 5. Stale cdp_loader_status.json with old dead port must NOT shadow fresh DevToolsActivePort
+    fs.writeFileSync(cdpFile, JSON.stringify({ active: true, pid: 99999998, cdpUrl: 'http://127.0.0.1:1', stage: 'attached' }), 'utf8');
+    const recoveredFromPortFile = await detectRuntimeLoaderStatus({
+      statusFile: directFile,
+      cdpStatusFile: cdpFile,
+      portFiles: [portFile],
+      isPidAlive: () => false
+    });
+    assert.equal(recoveredFromPortFile.active, false);
+    assert.equal(recoveredFromPortFile.mode, 'cdp-unattached');
+    assert.equal(recoveredFromPortFile.cdpReady, true);
+    assert.equal(recoveredFromPortFile.cdpPort, port);
+
+    // 6. Fallback endpoint probing works when DevToolsActivePort does not exist
+    const fallbackStatus = await detectRuntimeLoaderStatus({
+      statusFile: directFile,
+      cdpStatusFile: path.join(tmp, 'missing_cdp.json'),
+      portFiles: [path.join(tmp, 'missing_port')],
+      fallbackEndpoints: [`http://127.0.0.1:${port}`],
+      isPidAlive: () => false
+    });
+    assert.equal(fallbackStatus.active, false);
+    assert.equal(fallbackStatus.mode, 'cdp-unattached');
+    assert.equal(fallbackStatus.cdpReady, true);
+    assert.equal(fallbackStatus.cdpPort, port);
+
+    // 7. Live CDP injector in waiting stage (no conversation tab open yet) reports active waiting
+    fs.writeFileSync(cdpFile, JSON.stringify({ active: false, pid: process.pid, cdpUrl: `http://127.0.0.1:${port}`, stage: 'waiting' }), 'utf8');
+    const cdpWaiting = await detectRuntimeLoaderStatus({
+      statusFile: directFile,
+      cdpStatusFile: cdpFile,
+      portFiles: [portFile],
+      isPidAlive: (pid) => pid === process.pid
+    });
+    assert.equal(cdpWaiting.active, true);
+    assert.equal(cdpWaiting.mode, 'cdp');
+    assert.equal(cdpWaiting.stage, 'waiting');
+    assert.equal(cdpWaiting.cdpPort, port);
+  } finally {
+    try { cdpServer?.close(); } catch {}
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });

@@ -51,7 +51,7 @@
       fs.mkdirSync(path.dirname(STATUS_FILE), { recursive: true });
       fs.writeFileSync(
         STATUS_FILE,
-        JSON.stringify({ active: true, pid: process.pid, updatedAt: new Date().toISOString(), ...extra }, null, 2),
+        JSON.stringify({ active: true, mode: 'electron', pid: process.pid, updatedAt: new Date().toISOString(), ...extra }, null, 2),
         'utf8'
       );
     } catch {}
@@ -156,8 +156,8 @@ ${overlaySrc}
 
   let electronRef = null;
 
-  function resolveExistingCandidate(ops, rawPath, roots) {
-    const candidates = ops.resolveCandidatePaths(rawPath, roots);
+  function resolveExistingCandidate(ops, rawPath, ctx) {
+    const candidates = ops.resolveCandidatePaths(rawPath, ctx?.roots || [], ctx);
     if (!candidates.length) return '';
     return candidates.find((c) => fs.existsSync(c)) || candidates[0] || '';
   }
@@ -171,7 +171,7 @@ ${overlaySrc}
     const ctx = ops.resolveConversationContext(cid, pageUrl);
 
     if (method === 'getSession') {
-      return { id: ctx.id, cwd: ctx.cwd, roots: ctx.roots, outsideProject: ctx.outsideProject };
+      return { id: ctx.id, cwd: ctx.cwd, roots: ctx.roots, outsideProject: ctx.outsideProject, wsl: ctx.wsl };
     }
     if (method === 'getSettings') {
       return ops.loadSettings();
@@ -190,7 +190,7 @@ ${overlaySrc}
     }
     if (method === 'applications') {
       const statRes = await ops.statFile(ctx, params.path);
-      const absPath = statRes.ok ? statRes.value.absolutePath : resolveExistingCandidate(ops, params.path, ctx.roots);
+      const absPath = statRes.ok ? statRes.value.absolutePath : resolveExistingCandidate(ops, params.path, ctx);
       if (!absPath) return { ok: true, value: [] };
       const apps = await ops.discoverApplications(absPath, {
         getFileIcon: electronRef?.app?.getFileIcon
@@ -201,21 +201,21 @@ ${overlaySrc}
     }
     if (method === 'open') {
       const statRes = await ops.statFile(ctx, params.path);
-      const absPath = statRes.ok ? statRes.value.absolutePath : resolveExistingCandidate(ops, params.path, ctx.roots);
+      const absPath = statRes.ok ? statRes.value.absolutePath : resolveExistingCandidate(ops, params.path, ctx);
       if (!absPath) return { ok: false, error: { code: 'invalid-path' } };
       const ok = await ops.launchApplication(absPath, params.appId, electronRef?.shell);
       return ok ? { ok: true, value: { opened: true } } : { ok: false, error: { code: 'open-failed' } };
     }
     if (method === 'reveal') {
       const statRes = await ops.statFile(ctx, params.path);
-      const absPath = statRes.ok ? statRes.value.absolutePath : resolveExistingCandidate(ops, params.path, ctx.roots);
+      const absPath = statRes.ok ? statRes.value.absolutePath : resolveExistingCandidate(ops, params.path, ctx);
       if (!absPath) return { ok: false, error: { code: 'invalid-path' } };
       const ok = await ops.revealInExplorer(absPath, electronRef?.shell);
       return ok ? { ok: true, value: { revealed: true } } : { ok: false, error: { code: 'reveal-failed' } };
     }
     if (method === 'previewInBrowser') {
       const statRes = await ops.statFile(ctx, params.path);
-      const absPath = statRes.ok ? statRes.value.absolutePath : resolveExistingCandidate(ops, params.path, ctx.roots);
+      const absPath = statRes.ok ? statRes.value.absolutePath : resolveExistingCandidate(ops, params.path, ctx);
       if (!absPath) return { ok: false };
       const ok = await openSandboxedPreviewWindow(electronRef, absPath);
       return { ok };
@@ -395,6 +395,9 @@ ${overlaySrc}
     electronRef = electronMod;
 
     attachAll(electronMod.app, electronMod.webContents);
+    electronMod.app.once?.('will-quit', () => {
+      writeStatus({ active: false, stage: 'stopped' });
+    });
     void electronMod.app.whenReady().then(() => {
       attachAll(electronMod.app, electronMod.webContents);
     });
